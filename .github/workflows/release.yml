@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Test
+        run: go test ./...
+      - name: Build archives
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          test "$file_version" = "$VERSION"
+          mkdir -p dist
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            target_os="${target%/*}"
+            target_arch="${target#*/}"
+            archive="gws_${VERSION}_${target_os}_${target_arch}"
+            CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/${archive}/gws" ./cmd/gws
+            cp README.md README.zh.md LICENSE VERSION "dist/${archive}/"
+            tar -C dist -czf "dist/${archive}.tar.gz" "$archive"
+          done
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --verify-tag --generate-notes

@@ -1,0 +1,41 @@
+package gitworkspace
+
+import (
+	"fmt"
+	"os"
+	"strings"
+)
+
+func RenderTask(project Project, workspace Workspace) string {
+	typeName := strings.ToUpper(string(workspace.Type[:1])) + string(workspace.Type[1:])
+	permission := "You may modify project files to complete this task."
+	focus := "Implement the requested change, run relevant tests, and report the result."
+	if workspace.Type == WorkspaceReview {
+		permission = "Do not modify project files unless explicitly requested by the developer."
+		focus = "Compare target against base. Prioritize concrete defects and report findings ordered by severity with file and line references."
+	} else if workspace.Type == WorkspaceTest {
+		permission = "Do not modify project files unless explicitly requested by the developer."
+		focus = "Validate the target, run relevant tests, and report failures with reproducible details."
+	}
+	base := workspace.Source.BaseRef
+	if base == "" {
+		base = "(none)"
+	}
+	return fmt.Sprintf("# Git Workspace Task\n\nType: %s\nProject: %s\nWorkspace: %s\nTarget: %s\nBase: %s\nWorktree: %s\n\n## Instructions\n\n%s\n%s\n", typeName, project.Name, workspace.Name, workspace.Source.Ref, base, workspace.WorktreePath, focus, permission)
+}
+
+func WriteTask(path, content string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return WrapError("internal_error", "Failed to write Workspace task file.", err)
+	}
+	if _, err := file.WriteString(content); err != nil {
+		_ = file.Close()
+		return WrapError("internal_error", "Failed to write Workspace task file.", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
