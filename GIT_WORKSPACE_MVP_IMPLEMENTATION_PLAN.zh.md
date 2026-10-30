@@ -112,7 +112,7 @@ Workspace 身份不能使用分支名，因为同一基线可以创建多个隔�
 ├── tasks/<workspace-id>.md
 └── locks/state.lock
 
-<parent>/<repo-name>-gws/<workspace-id>/    worktree 检出目录
+<repo>/.git/gws/worktrees/<workspace-id>/    worktree 检出目录
 ```
 
 元数据挂在 common dir 下，所有 linked worktree 共享；worktree 放在仓库同级目录，避免嵌套进 `.git` 或污染工作区。克隆仓库不携带任何 gws 数据。
@@ -146,7 +146,7 @@ Workspace 身份不能使用分支名，因为同一基线可以创建多个隔�
 1. 解析真实 worktree 和规范路径；
 2. 确认目标严格位于本仓库 worktree 根之下，且不等于仓库根/父目录/worktree 根；
 3. 确认 Git 注册和 Workspace 元数据所有权；
-4. 非 `--force` 模式拒绝 dirty worktree；
+4. 非 `--force` 模式拒绝 dirty worktree 和尚未合入基线的托管分支提交；
 5. 先写 `removing` 状态；
 6. 通过 `git worktree remove` 删除；
 7. 删除任务和 Workspace 元数据；
@@ -181,7 +181,7 @@ doctor
 1. 二进制固定为 `gws`；
 2. Go 模块和内部包使用 `gws`；
 3. 状态目录固定 `<repo>/.git/gws/`，无环境变量覆盖；
-4. worktree 根固定 `<parent>/<repo>-gws/`；
+4. worktree 根固定 `<repo>/.git/gws/worktrees/`；
 5. 项目配置只读取 `.git/gws/config.json`；
 6. 托管分支前缀固定为 `gws/`；
 7. 不探测、不读取、不迁移其他品牌的环境变量、状态目录或配置文件；旧 `~/.git-workspace` 与 `.git-workspace.yaml` 不迁移（pre-1.0）。
@@ -225,7 +225,8 @@ doctor
 ### 阶段 5：极简化重构（本轮）
 
 - [x] 移除 Project 注册表：`init`、`project ls|show|rm`、`--project`、`GIT_WORKSPACE_HOME`；
-- [x] 状态迁入 `<repo>/.git/gws/`，worktree 改为同级 `<parent>/<repo>-gws/<id>/`；
+- [x] 状态迁入 `<repo>/.git/gws/`，worktree 改为 `<repo>/.git/gws/worktrees/<id>/`；
+- [x] 释放空间时清除全部 `gws` 衍生痕迹（worktree、托管分支、任务文件、元数据、空 worktree 根）；
 - [x] 配置改读 `.git/gws/config.json`（JSON，替换 YAML）；
 - [x] `dev/review/fix/test` 并入 `new --type/--detach`；`checkout` 改为 `use`；
 - [x] `new` 无参即用：默认基线 = 当前分支，创建后默认进入子 Shell；

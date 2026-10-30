@@ -13,8 +13,7 @@ type Paths struct {
 
 func NewPaths(repo Repository) (Paths, error) {
 	stateDir := filepath.Join(repo.GitCommonDir, "gws")
-	parent := filepath.Dir(repo.Root)
-	worktreesDir := filepath.Join(parent, filepath.Base(repo.Root)+"-gws")
+	worktreesDir := filepath.Join(stateDir, "worktrees")
 	return Paths{StateDir: stateDir, WorktreesDir: worktreesDir}, nil
 }
 

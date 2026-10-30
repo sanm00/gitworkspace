@@ -22,6 +22,23 @@ are expected between minor versions.
 
 ### Changed (breaking, pre-1.0)
 
+- Worktree checkouts now live inside the Git directory at
+  `<repo>/.git/gws/worktrees/<id>/` instead of the sibling
+  `<parent>/<repo>-gws/<id>/`. Neither the repository root nor its parent gains
+  a folder, and the main checkout stays clean. Existing Workspaces keep working
+  because metadata stores absolute paths.
+- Releasing a Workspace (`rm`/`finish`) now removes every artifact gws created:
+  the checkout, its managed branch, the task file, the Workspace record, and an
+  emptied `worktrees/` root. A vanished but still registered worktree is pruned
+  instead of failing the release.
+- `gws finish` no longer requires leaving the Workspace first: inside a
+  Workspace the id defaults to that Workspace. If the Workspace was opened by
+  `gws new`/`gws use` (zsh and bash), finishing also closes that subshell so you
+  are back where you started; otherwise it prints the `cd` to run.
+- `rm` without `--force` now also refuses a managed branch whose commits are not
+  merged into its base branch (`workspace_unmerged`); `--force` discards them.
+  `--force` still never bypasses path ownership checks.
+
 - State moved from `~/.git-workspace` into the repository: metadata, tasks,
   locks, and configuration now live under `<repo>/.git/gws/`, and worktrees
   are created in the sibling directory `<parent>/<repo>-gws/<id>/`. Old global

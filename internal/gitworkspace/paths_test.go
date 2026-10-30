@@ -15,7 +15,7 @@ func TestNewPathsLayout(t *testing.T) {
 	if paths.StateDir != filepath.Join(common, "gws") {
 		t.Fatalf("state dir=%s", paths.StateDir)
 	}
-	if paths.WorktreesDir != filepath.Join(filepath.Dir(repo), "demo-gws") {
+	if paths.WorktreesDir != filepath.Join(common, "gws", "worktrees") {
 		t.Fatalf("worktrees dir=%s", paths.WorktreesDir)
 	}
 	if got := paths.WorktreePath("abc"); got != filepath.Join(paths.WorktreesDir, "abc") {

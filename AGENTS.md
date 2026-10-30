@@ -27,14 +27,19 @@ cp -R skills/git-workspace ~/.agents/skills/git-workspace
 
 ### Short version of the workflow
 
-1. `gws new <name> --no-enter --json` → creates an isolated worktree, records the
-   base branch and base commit, and returns `data.worktree_path`.
+1. `gws new <name> --no-enter --json` → creates an isolated worktree under
+   `<repo>/.git/gws/worktrees/<id>/`, records the base branch and base commit,
+   and returns `data.worktree_path`. Search inside it by passing the absolute
+   path to `rg` (a repo-wide scan from the main checkout intentionally skips
+   `.git`).
 2. Do all edits inside that worktree path.
 3. `gws diff` / `gws log` to inspect your own work.
 4. `git add -A && gws commit -m "..."` inside the worktree.
 5. `gws apply --json` (run inside the worktree) to merge back. Route on
    `error.code`; never switch branches in the main checkout by hand.
-6. Cleanup only when asked: `gws rm <id>` or `gws finish <id>` from outside.
+6. Cleanup only when asked: `gws rm <id>` anywhere, or `gws finish [id]` — inside
+   the worktree the id may be omitted, and a zsh/bash `gws new`/`gws use`
+   subshell closes on its own; otherwise `cd` back to the printed path.
 
 Full rules, triggers, and the error-code table live in
 [`skills/git-workspace/SKILL.md`](skills/git-workspace/SKILL.md).

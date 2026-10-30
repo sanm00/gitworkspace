@@ -67,7 +67,7 @@ gws new
 
 `gws new` needs no arguments. It bases the Workspace on the current branch,
 creates a managed branch `gws/<name>` at that exact commit, opens a worktree in
-a sibling directory (`../example-gws/<id>/`), stores its metadata under
+an internal Git directory (`.git/gws/worktrees/<id>/`), stores its metadata under
 `.git/gws/`, and drops you into a shell there. When you are done, `exit`.
 
 Every command reports the baseline it used:
@@ -77,7 +77,7 @@ Created Workspace feature-x-9f2c
 Type: dev
 Based on: feature-x (1a2b3c4d)
 Branch: gws/feature-x
-Worktree: /Users/you/projects/example-gws/feature-x-9f2c
+Worktree: /Users/you/projects/example/.git/gws/worktrees/feature-x-9f2c
 ```
 
 To enter an existing Workspace later:
@@ -108,7 +108,15 @@ When you are finished for good, run from the main checkout:
 gws finish feature-x-9f2c  # merge back, then remove worktree and managed branch
 ```
 
-`finish` applies first and cleans up only after a successful merge.
+`finish` applies first and cleans up only after a successful merge. Run it from
+the main checkout, or straight from inside the Workspace — there the ID can be
+omitted. When the Workspace was opened by `gws new` or `gws use`, finishing also closes
+that subshell, so you land back where you started. That works by installing a
+small `gws` shell function in the subshell (zsh and bash), which turns the
+"leave this Workspace" exit code into `exit 0`; a child process cannot move its
+parent shell, and interactive shells ignore `SIGTERM`. In other shells, with
+`--json`, or when `gws` is invoked by absolute path, it prints the `cd` to run
+instead.
 
 ## Other workspace types
 
@@ -135,7 +143,10 @@ gws diff --staged --stat              # staged changes as a summary
 gws log -n 5                          # commits on top of the base
 ```
 
-`gws diff` prints ordinary `git diff` output and lists untracked files
+`gws commit -a` stages **every** change first, including new files, so it is the
+one-shot "commit what I have" command. Without `-a` only what you already staged
+with `git add` is committed, and `gws` says so instead of hand­ling a confusing
+Git error. `gws diff` prints ordinary `git diff` output and lists untracked files
 separately, because Git never includes them in a diff. `gws commit` refuses
 detached review/test Workspaces, which are read-only by design.
 
@@ -144,11 +155,11 @@ detached review/test Workspaces, which are read-only by design.
 ```text
 gws new [NAME] [--base BRANCH|SHA] [--type dev|fix|review|test] [--detach] [--fetch] [--no-enter] [--json]
 gws use [WORKSPACE]
-gws commit --message MESSAGE [-a] [--json]
+gws commit --message MESSAGE [-a|--all] [--json]
 gws diff [WORKSPACE] [--staged] [--stat] [--uncommitted] [--json]
 gws log [WORKSPACE] [-n N] [--stat] [--json]
 gws apply [--into BRANCH]
-gws finish WORKSPACE [--into BRANCH]
+gws finish [WORKSPACE] [--into BRANCH]
 gws ls | show | status | path [WORKSPACE]
 gws rm WORKSPACE [--force]
 gws gc [--dry-run]
@@ -167,8 +178,12 @@ must run inside a Git repository.
   only owned branches are ever deleted automatically.
 - `apply`/`finish` check all preconditions first and report blocking reasons
   instead of half-applying; `finish` never cleans up when the merge fails.
-- Normal removal refuses dirty worktrees. `--force` bypasses only the dirty
-  check, never path ownership checks.
+- Releasing a Workspace (`rm`/`finish`) removes everything it created: the
+  worktree, its managed branch, the task file, its metadata, and the worktree
+  root once empty. Nothing derived by `gws` is left behind.
+- Normal removal refuses dirty worktrees and commits not yet merged into the
+  base branch. `--force` bypasses only those two safety checks, never path
+  ownership checks.
 - `gc` prunes metadata for vanished worktrees but never deletes user branches.
 
 ## Platform/plugin integration
@@ -261,12 +276,14 @@ Everything `gws` persists lives inside the repository:
 <repo>/.git/gws/workspaces/<id>.json workspace metadata
 <repo>/.git/gws/tasks/<id>.md        task brief for coding agents
 <repo>/.git/gws/locks/state.lock     inter-process lock
-<parent>/<repo>-gws/<id>/            worktree checkout
+<repo>/.git/gws/worktrees/<id>/      worktree checkout
 ```
 
-Metadata sits under the Git common directory, so all worktrees of one
-repository share the same state, and cloning the repository carries nothing
-over. Optional configuration is `.git/gws/config.json`:
+Everything lives under the Git common directory, so all worktrees of one
+repository share the same state, cloning the repository carries nothing over,
+and neither the repository root nor its parent gains an extra folder. Releasing
+a Workspace removes its checkout, branch, task file, and record, and drops the
+`worktrees/` root once empty. Optional configuration is `.git/gws/config.json`:
 
 ```json
 { "version": 1, "default_branch": "main" }

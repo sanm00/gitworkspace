@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -101,11 +102,22 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 	default:
 		runErr = gitworkspace.NewError("config_invalid", fmt.Sprintf("Unknown command %q. Run gws --help.", command))
 	}
+	if errors.Is(runErr, errExitShell) {
+		return ExitWorkspace
+	}
 	if runErr != nil {
 		return fail(streams, command, jsonMode, runErr)
 	}
 	return 0
 }
+
+// errExitShell signals that the Workspace subshell should close. The shell
+// wrapper function installed by LaunchShell watches for ExitWorkspace and turns
+// it into "exit 0", because a child process cannot move its parent shell.
+var errExitShell = errors.New("exit workspace shell")
+
+// ExitWorkspace is the exit code the wrapper function watches for.
+const ExitWorkspace = gitworkspace.ExitWorkspaceShell
 
 type parsedArgs struct {
 	positional []string
@@ -204,16 +216,20 @@ func runNew(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs
 	return app.LaunchShell(ctx, created, s.in, s.out, s.err)
 }
 
-func shouldEnter(p parsedArgs, s ioStreams) bool {
-	if p.bool("json") || p.bool("no-enter") {
-		return false
-	}
-	file, ok := s.out.(*os.File)
+func isTerminal(out io.Writer) bool {
+	file, ok := out.(*os.File)
 	if !ok {
 		return false
 	}
 	info, err := file.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func shouldEnter(p parsedArgs, s ioStreams) bool {
+	if p.bool("json") || p.bool("no-enter") {
+		return false
+	}
+	return isTerminal(s.out)
 }
 
 func shortSHA(value string) string {
@@ -252,22 +268,28 @@ func runApply(ctx context.Context, app *gitworkspace.App, cwd string, p parsedAr
 }
 
 func runFinish(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
-	selector := p.optional(0)
-	if selector == "" {
-		return gitworkspace.NewError("config_invalid", "Missing a Workspace argument. Usage: gws finish <workspace-id>. Run gws ls to list candidates.")
-	}
-	result, err := app.FinishWorkspace(ctx, selector, p.value("into"), cwd)
+	result, err := app.FinishWorkspace(ctx, p.optional(0), p.value("into"), cwd)
 	if err != nil {
 		return err
 	}
 	if p.bool("json") {
 		return writeJSON(s.out, "finish", applyView(result), nil)
 	}
+	leavesShell := result.CWDInside &&
+		os.Getenv(gitworkspace.ShellMarkerEnv) == result.Workspace.ID &&
+		os.Getenv(gitworkspace.ShellWrappedEnv) == "1"
 	branchAction := "preserved"
 	if result.Workspace.Source.Managed {
 		branchAction = "removed"
 	}
 	fmt.Fprintf(s.out, "Finished Workspace %s (%s)\nApplied: %s -> %s\nRemoved: %s\nBranch %s was %s.\n", result.Workspace.Name, result.Workspace.ID, result.SourceBranch, result.TargetBranch, result.Workspace.WorktreePath, result.SourceBranch, branchAction)
+	if leavesShell {
+		fmt.Fprintln(s.out, "\nClosing the Workspace shell; you are back where you started.")
+		return errExitShell
+	}
+	if result.CWDInside {
+		fmt.Fprintf(s.out, "\nYour shell was inside the removed directory. Run: cd %s\n", result.RepoRoot)
+	}
 	return nil
 }
 
@@ -307,7 +329,7 @@ func runShow(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArg
 	if p.bool("json") {
 		return writeJSON(s.out, "show", showData{Workspace: workspaceView(workspace)}, nil)
 	}
-	fmt.Fprintf(s.out, "Workspace: %s\nID: %s\nRepository: %s\nGit common dir: %s\nType: %s\nBranch: %s\nBase: %s\nBase commit: %s\nManaged branch: %t\nStatus: %s\nWorktree: %s\nTask: %s\nCreated: %s\nUpdated: %s\n", workspace.Name, workspace.ID, app.Repo.Root, app.Repo.GitCommonDir, workspace.Type, workspace.Source.Ref, displayValue(baseRef(workspace)), displayValue(workspace.Source.BaseCommit), workspace.Source.Managed, workspace.State, workspace.WorktreePath, workspace.TaskFilePath, workspace.CreatedAt.UTC().Format(time.RFC3339), workspace.UpdatedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(s.out, "Workspace: %s\nID: %s\nRepository: %s\nGit common dir: %s\nType: %s\nBranch: %s\nBase: %s\nBase commit: %s\nManaged branch: %t\nStatus: %s\nWorktree: %s\nTask: %s\nCreated: %s\nUpdated: %s\n", workspace.Name, workspace.ID, app.Repo.RepoPath(), app.Repo.GitCommonDir, workspace.Type, workspace.Source.Ref, displayValue(baseRef(workspace)), displayValue(workspace.Source.BaseCommit), workspace.Source.Managed, workspace.State, workspace.WorktreePath, workspace.TaskFilePath, workspace.CreatedAt.UTC().Format(time.RFC3339), workspace.UpdatedAt.UTC().Format(time.RFC3339))
 	return nil
 }
 
@@ -397,7 +419,12 @@ func runLog(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs
 
 func runCommit(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
 	if len(p.positional) > 0 {
-		return gitworkspace.NewError("config_invalid", "gws commit takes no positional arguments. Run it from inside the Workspace; message goes to --message.")
+		first := p.positional[0]
+		message := "gws commit takes no positional arguments. Run it from inside the Workspace; message goes to --message."
+		if strings.HasPrefix(first, "-") {
+			message = fmt.Sprintf("Unknown option %s. Use -a and --message/-m separately, for example: gws commit -m \"summary\" -a", first)
+		}
+		return gitworkspace.NewError("config_invalid", message)
 	}
 	result, err := app.CommitWorkspace(ctx, cwd, p.value("message"), p.bool("all"))
 	if err != nil {
@@ -730,7 +757,7 @@ Workflow:
   gws commit -m ...       commit inside the Workspace (--all includes tracked changes)
   gws diff                show everything this Workspace changed since its base
   gws apply               merge the Workspace back into its base branch (run inside the Workspace)
-  gws finish <id>         merge back and clean up (run outside the Workspace)
+  gws finish [id]         merge back and clean up (id defaults to the current Workspace)
 
 Machine interface:
   Add --json to non-interactive commands. use is always interactive; new enters a shell unless --json/--no-enter is set.

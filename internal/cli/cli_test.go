@@ -127,7 +127,6 @@ func TestMissingArgumentsIncludeActionableUsage(t *testing.T) {
 		args     []string
 		expected string
 	}{
-		{args: []string{"finish"}, expected: "Usage: gws finish <workspace-id>"},
 		{args: []string{"rm"}, expected: "Usage: gws rm <workspace-id>"},
 	} {
 		var out, stderr bytes.Buffer
@@ -249,8 +248,8 @@ func TestNewWithoutNameEntersNoShellInNonTTY(t *testing.T) {
 		t.Fatalf("non-tty new did not print the use hint: %s", text)
 	}
 	id := workspaceIDFromOutput(t, text)
-	if _, err := os.Stat(filepath.Join(filepath.Dir(repo), "repo-gws", id)); err != nil {
-		t.Fatalf("worktree was not created in the sibling directory: %v", err)
+	if _, err := os.Stat(filepath.Join(repo, ".git", "gws", "worktrees", id)); err != nil {
+		t.Fatalf("worktree was not created inside the Git directory: %v", err)
 	}
 }
 
@@ -321,7 +320,7 @@ func TestUseLaunchesShellInWorkspaceDirectory(t *testing.T) {
 		t.Fatalf("new code=%d stderr=%s", code, stderr.String())
 	}
 	id := workspaceIDFromOutput(t, out.String())
-	worktree := filepath.Join(filepath.Dir(repo), "repo-gws", id)
+	worktree := filepath.Join(repo, ".git", "gws", "worktrees", id)
 	t.Setenv("SHELL", "/bin/pwd")
 	out.Reset()
 	stderr.Reset()
@@ -331,6 +330,83 @@ func TestUseLaunchesShellInWorkspaceDirectory(t *testing.T) {
 	if !strings.Contains(out.String(), worktree) {
 		t.Fatalf("use did not enter the worktree: %s", out.String())
 	}
+}
+
+func TestFinishInsideWrappedShellReturnsExitSentinel(t *testing.T) {
+	repo := newCLITestRepo(t)
+	chdir(t, repo)
+	setGitIdentityEnv(t)
+	var out, stderr bytes.Buffer
+	if code := Run([]string{"new", "wrapped", "--no-enter"}, bytes.NewReader(nil), &out, &stderr, "test"); code != 0 {
+		t.Fatalf("new code=%d stderr=%s", code, stderr.String())
+	}
+	id := workspaceIDFromOutput(t, out.String())
+	chdir(t, filepath.Join(repo, ".git", "gws", "worktrees", id))
+	t.Setenv(gitworkspace.ShellMarkerEnv, id)
+	t.Setenv(gitworkspace.ShellWrappedEnv, "1")
+	out.Reset()
+	stderr.Reset()
+	code := Run([]string{"finish"}, bytes.NewReader(nil), &out, &stderr, "test")
+	if code != gitworkspace.ExitWorkspaceShell {
+		t.Fatalf("wrapped shell finish code=%d stdout=%s stderr=%s", code, out.String(), stderr.String())
+	}
+	text := out.String()
+	if !strings.Contains(text, "Closing the Workspace shell") || strings.Contains(text, "Run: cd ") {
+		t.Fatalf("finish output=%s", text)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "gws", "worktrees", id)); !os.IsNotExist(err) {
+		t.Fatalf("worktree survived: %v", err)
+	}
+	if got := strings.TrimSpace(string(mustGitOutput(t, repo, "branch", "--list", "gws/*"))); got != "" {
+		t.Fatalf("managed branch survived: %q", got)
+	}
+}
+
+func TestFinishInsidePlainShellPrintsCDHint(t *testing.T) {
+	repo := newCLITestRepo(t)
+	chdir(t, repo)
+	setGitIdentityEnv(t)
+	var out, stderr bytes.Buffer
+	if code := Run([]string{"new", "hint2", "--no-enter"}, bytes.NewReader(nil), &out, &stderr, "test"); code != 0 {
+		t.Fatalf("new code=%d stderr=%s", code, stderr.String())
+	}
+	id := workspaceIDFromOutput(t, out.String())
+	worktree := filepath.Join(repo, ".git", "gws", "worktrees", id)
+	chdir(t, worktree)
+	t.Setenv(gitworkspace.ShellMarkerEnv, id)
+	t.Setenv(gitworkspace.ShellWrappedEnv, "")
+	out.Reset()
+	stderr.Reset()
+	if code := Run([]string{"finish"}, bytes.NewReader(nil), &out, &stderr, "test"); code != 0 {
+		t.Fatalf("finish code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(out.String(), "Run: cd ") {
+		t.Fatalf("unwraped shell must get a cd hint: %s", out.String())
+	}
+}
+
+// buildGWS compiles the real binary so a launched subshell can invoke gws the
+// way a user would.
+func buildGWS(t *testing.T) string {
+	t.Helper()
+	here, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := filepath.Abs(filepath.Join(here, "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		t.Fatalf("repository root not found from %s: %v", here, err)
+	}
+	binary := filepath.Join(t.TempDir(), "gws")
+	cmd := exec.Command("go", "build", "-o", binary, "./cmd/gws")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v %s", err, out)
+	}
+	return binary
 }
 
 func TestApplyRejectsPositionalArgument(t *testing.T) {
@@ -346,6 +422,67 @@ func TestApplyOutsideWorkspace(t *testing.T) {
 	var out, stderr bytes.Buffer
 	if code := Run([]string{"apply"}, bytes.NewReader(nil), &out, &stderr, "test"); code == 0 || !strings.Contains(stderr.String(), "not inside a registered Workspace") {
 		t.Fatalf("code=%d stdout=%s stderr=%s", code, out.String(), stderr.String())
+	}
+}
+
+func TestFinishWithoutArgumentUsesCurrentWorkspace(t *testing.T) {
+	repo := newCLITestRepo(t)
+	chdir(t, repo)
+	setGitIdentityEnv(t)
+	var out, stderr bytes.Buffer
+	if code := Run([]string{"new", "inner", "--no-enter"}, bytes.NewReader(nil), &out, &stderr, "test"); code != 0 {
+		t.Fatalf("new code=%d stderr=%s", code, stderr.String())
+	}
+	id := workspaceIDFromOutput(t, out.String())
+	worktree := filepath.Join(repo, ".git", "gws", "worktrees", id)
+	if err := os.WriteFile(filepath.Join(worktree, "inner.txt"), []byte("inner\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustGitOutput(t, worktree, "add", "inner.txt")
+	mustGitOutput(t, worktree, "commit", "-m", "inner change")
+
+	chdir(t, worktree)
+	out.Reset()
+	stderr.Reset()
+	if code := Run([]string{"finish"}, bytes.NewReader(nil), &out, &stderr, "test"); code != 0 {
+		t.Fatalf("finish code=%d stderr=%s", code, stderr.String())
+	}
+	text := out.String()
+	repoCanonical, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Finished Workspace inner ("+id+")") || !strings.Contains(text, "cd "+repoCanonical) {
+		t.Fatalf("finish output=%s", text)
+	}
+	if _, err := os.Stat(worktree); !os.IsNotExist(err) {
+		t.Fatalf("worktree survived finish: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "inner.txt")); err != nil {
+		t.Fatalf("change was not applied to the main checkout: %v", err)
+	}
+	if !strings.Contains(string(mustGitOutput(t, repo, "log", "-1", "--pretty=%s")), "inner change") {
+		t.Fatal("main branch did not receive the commit")
+	}
+}
+
+func TestCommitOptionHintForUnknownShortFlags(t *testing.T) {
+	repo := newCLITestRepo(t)
+	chdir(t, repo)
+	setGitIdentityEnv(t)
+	var out, stderr bytes.Buffer
+	if code := Run([]string{"new", "hint", "--no-enter"}, bytes.NewReader(nil), &out, &stderr, "test"); code != 0 {
+		t.Fatalf("new code=%d stderr=%s", code, stderr.String())
+	}
+	id := workspaceIDFromOutput(t, out.String())
+	chdir(t, filepath.Join(repo, ".git", "gws", "worktrees", id))
+	out.Reset()
+	stderr.Reset()
+	if code := Run([]string{"commit", "-am", "combined"}, bytes.NewReader(nil), &out, &stderr, "test"); code == 0 {
+		t.Fatal("-am is not a supported short flag and must be rejected")
+	}
+	if !strings.Contains(stderr.String(), "Unknown option -am") || !strings.Contains(stderr.String(), "gws commit -m") {
+		t.Fatalf("stderr=%s", stderr.String())
 	}
 }
 

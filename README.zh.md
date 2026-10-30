@@ -56,7 +56,7 @@ git checkout feature-x
 gws new
 ```
 
-`gws new` 不需要任何参数。它以当前分支为基线创建 Workspace，在该 commit 上建立托管分支 `gws/<name>`，在同级目录（`../example-gws/<id>/`）开出 worktree，把元数据写入 `.git/gws/`，然后直接进入其中的子 Shell。用完 `exit` 退出。
+`gws new` 不需要任何参数。它以当前分支为基线创建 Workspace，在该 commit 上建立托管分支 `gws/<name>`，在 Git 内部目录（`.git/gws/worktrees/<id>/`）开出 worktree，把元数据写入 `.git/gws/`，然后直接进入其中的子 Shell。用完 `exit` 退出。项目根和项目同级都不会多出任何目录。
 
 每条命令都会报告所用的基线：
 
@@ -65,7 +65,7 @@ Created Workspace feature-x-9f2c
 Type: dev
 Based on: feature-x (1a2b3c4d)
 Branch: gws/feature-x
-Worktree: /Users/you/projects/example-gws/feature-x-9f2c
+Worktree: /Users/you/projects/example/.git/gws/worktrees/feature-x-9f2c
 ```
 
 之后要再进入这个 Workspace：
@@ -93,7 +93,7 @@ gws apply                  # 合并进基线分支，保留 Workspace
 gws finish feature-x-9f2c  # 合并后删除 worktree 与托管分支
 ```
 
-`finish` 先应用成果，只有合并成功才执行清理。
+`finish` 先应用成果，只有合并成功才执行清理。既可以在主检出执行，也可以直接在当前 Workspace 里执行——此时可以省略 ID。如果这个空间是 `gws new` / `gws use` 打开的子 Shell，finish 成功后会一并退出该子 Shell，让你回到最初的位置。实现方式是在子 Shell 里注入一个 `gws` shell 函数（zsh/bash），由它把"退出空间"的退出码转成 `exit 0`；子进程无法移动父 shell 的目录，而交互式 shell 又会忽略 `SIGTERM`。其他 shell、使用 `--json`、或用绝对路径调用 `gws` 时，改为打印需要执行的 `cd`。
 
 ## 其他工作空间类型
 
@@ -117,18 +117,18 @@ gws diff --staged --stat          # 已暂存改动的摘要
 gws log -n 5                      # 基线之上的提交
 ```
 
-`gws diff` 输出的就是普通 `git diff` 内容，并把未跟踪文件单独列出（Git 的 diff 从不包含它们）。`gws commit` 拒绝 detached 的 review/test 空间——它们按设计是只读的。
+`gws commit -a` 会先暂存**全部**改动，包括新文件，是"把手上这些一次提交掉"的命令。不带 `-a` 时只提交你已经用 `git add` 暂存的内容，没暂存时 `gws` 会直接说明，而不是抛出难懂的 Git 报错。`gws diff` 输出的就是普通 `git diff` 内容，并把未跟踪文件单独列出（Git 的 diff 从不包含它们）。`gws commit` 拒绝 detached 的 review/test 空间——它们按设计是只读的。
 
 ## 核心命令
 
 ```text
 gws new [NAME] [--base BRANCH|SHA] [--type dev|fix|review|test] [--detach] [--fetch] [--no-enter] [--json]
 gws use [WORKSPACE]
-gws commit --message MESSAGE [-a] [--json]
+gws commit --message MESSAGE [-a|--all] [--json]
 gws diff [WORKSPACE] [--staged] [--stat] [--uncommitted] [--json]
 gws log [WORKSPACE] [-n N] [--stat] [--json]
 gws apply [--into BRANCH]
-gws finish WORKSPACE [--into BRANCH]
+gws finish [WORKSPACE] [--into BRANCH]
 gws ls | show | status | path [WORKSPACE]
 gws rm WORKSPACE [--force]
 gws gc [--dry-run]
@@ -144,7 +144,8 @@ gws capabilities [--json]
 - 创建时先记录 `creating` 状态，失败时回滚部分资源；
 - 托管分支位于 `gws/` 命名空间并带有所有权标记，只有被标记托管的分支才会自动删除；
 - `apply`/`finish` 先行全量前置校验并报告阻塞原因，不会半应用；合并失败时 `finish` 不执行清理；
-- 普通删除拒绝包含未提交修改的 worktree；`--force` 只跳过 dirty 检查，不跳过路径所有权检查；
+- 释放空间（`rm`/`finish`）会清除它创建的一切：worktree、托管分支、任务文件、元数据，以及空掉的 worktree 根目录，不在仓库里留下任何 `gws` 衍生痕迹；
+- 普通删除拒绝包含未提交修改的 worktree，也拒绝尚未合入基线的提交；`--force` 只跳过这两项安全检查，不跳过路径所有权检查；
 - `gc` 清理 worktree 已消失的元数据，但从不删除用户分支。
 
 ## 平台插件接口
@@ -221,10 +222,10 @@ PR"、"别动我当前分支"等请求下触发。
 <repo>/.git/gws/workspaces/<id>.json Workspace 元数据
 <repo>/.git/gws/tasks/<id>.md        供编程智能体使用的任务说明
 <repo>/.git/gws/locks/state.lock     跨进程锁
-<parent>/<repo>-gws/<id>/            worktree 检出目录
+<repo>/.git/gws/worktrees/<id>/      worktree 检出目录
 ```
 
-元数据存放在 Git common 目录下，因此同一仓库的所有 worktree 共享一份状态；克隆仓库不会带走任何 `gws` 数据。可选配置文件为 `.git/gws/config.json`：
+所有内容都在 Git common 目录下，因此同一仓库的所有 worktree 共享一份状态；克隆仓库不会带走任何 `gws` 数据；仓库根目录和它的父目录都不会多出额外文件夹。释放空间会删除对应的检出目录、分支、任务文件和记录，并在 `worktrees/` 为空时移除该根目录。可选配置文件为 `.git/gws/config.json`：
 
 ```json
 { "version": 1, "default_branch": "main" }

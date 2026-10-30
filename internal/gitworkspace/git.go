@@ -48,7 +48,28 @@ func (g Git) DetectRepository(ctx context.Context, path string) (Repository, err
 	if branchErr == nil {
 		branch = strings.TrimSpace(branchResult.Stdout)
 	}
-	return Repository{Root: root, GitCommonDir: common, CurrentBranch: branch}, nil
+	mainRoot := root
+	if listResult, listErr := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", root, "worktree", "list", "--porcelain"}}); listErr == nil {
+		for _, line := range strings.Split(listResult.Stdout, "\n") {
+			if rest, ok := strings.CutPrefix(line, "worktree "); ok {
+				if resolved, resolveErr := canonical(strings.TrimSpace(rest)); resolveErr == nil {
+					mainRoot = resolved
+				}
+				break
+			}
+		}
+	}
+	return Repository{Root: root, MainRoot: mainRoot, GitCommonDir: common, CurrentBranch: branch}, nil
+}
+
+// RepoPath returns the main checkout. Repo-scoped operations must use it
+// because a linked worktree can disappear (and its own root is not a valid
+// context for branch or worktree administration).
+func (r Repository) RepoPath() string {
+	if r.MainRoot != "" {
+		return r.MainRoot
+	}
+	return r.Root
 }
 
 func (g Git) ResolveCommit(ctx context.Context, repoPath, ref string) (string, error) {
@@ -208,14 +229,26 @@ func (g Git) Log(ctx context.Context, path, base string, limit int, stat bool) (
 }
 
 func (g Git) Commit(ctx context.Context, path, message string, all bool) error {
-	args := []string{"-C", path, "commit", "-m", message}
 	if all {
-		args = append(args, "--all")
+		if _, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", path, "add", "-A"}}); err != nil {
+			return WrapError("commit_failed", "Failed to stage the Workspace changes.", err)
+		}
 	}
-	if _, err := g.Runner.Run(ctx, Command{Path: "git", Args: args}); err != nil {
-		return WrapError("commit_failed", "Failed to commit the Workspace. Stage untracked files with git add first; --all only includes tracked files.", err)
+	if _, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", path, "commit", "-m", message}}); err != nil {
+		return WrapError("commit_failed", "Failed to commit the Workspace changes.", err)
 	}
 	return nil
+}
+
+func (g Git) HasStagedChanges(ctx context.Context, path string) (bool, error) {
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", path, "diff", "--cached", "--quiet"}})
+	if err != nil {
+		if result.ExitCode == 1 {
+			return true, nil
+		}
+		return false, WrapError("external_command_failed", "Failed to inspect staged changes.", err)
+	}
+	return false, nil
 }
 
 func (g Git) HeadSummary(ctx context.Context, path string) (string, string, error) {
@@ -230,6 +263,18 @@ func (g Git) HeadSummary(ctx context.Context, path string) (string, string, erro
 		subject = parts[1]
 	}
 	return commit, subject, nil
+}
+
+func (g Git) CountCommits(ctx context.Context, repoPath, revisionRange string) (int, error) {
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", repoPath, "rev-list", "--count", revisionRange}})
+	if err != nil {
+		return 0, WrapError("external_command_failed", fmt.Sprintf("Failed to count commits in %q.", revisionRange), err)
+	}
+	count := 0
+	if _, err := fmt.Sscanf(strings.TrimSpace(result.Stdout), "%d", &count); err != nil {
+		return 0, WrapError("external_command_failed", fmt.Sprintf("Unexpected commit count %q.", strings.TrimSpace(result.Stdout)), err)
+	}
+	return count, nil
 }
 
 func (g Git) DeleteBranch(ctx context.Context, repoPath, ref string, force bool) error {

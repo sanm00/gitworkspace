@@ -24,8 +24,13 @@ go install github.com/sanm00/gitworkspace/cmd/gws@latest
 If `gws` is still not found afterwards, its directory is probably not on PATH:
 `$(go env GOPATH)/bin`. Report that to the user instead of guessing.
 
-Run everything in the repository the user is working in. `gws` stores state in
-`<repo>/.git/gws/` and creates worktrees in `<repo-parent>/<repo>-gws/<id>/`.
+Run everything in the repository the user is working in. `gws` stores state and
+worktree checkouts together inside the repository: metadata in
+`<repo>/.git/gws/`, checkouts in `<repo>/.git/gws/worktrees/<id>/`. Because they
+live under `.git`, a repository-wide search from the main checkout skips them on
+purpose; when searching inside the workspace, pass its absolute path to `rg`
+(that works by default), and only add `--hidden --no-ignore` if you scan from a
+parent directory.
 
 ## 1. Create
 
@@ -61,7 +66,7 @@ gws status               # workspace state, base, dirty flag
 
 ```bash
 git -C <worktree_path> add -A
-gws commit -m "<concise summary>"
+gws commit -m "<concise summary>" -a
 gws apply --json          # must run with cwd inside the worktree
 ```
 
@@ -71,6 +76,8 @@ an error envelope, do not retry blindly. Route on `error.code`:
 | code | what it means | what you should do |
 |---|---|---|
 | `workspace_dirty` | uncommitted changes remain | commit them first |
+| `workspace_nothing_staged` | `gws commit` without `-a` and nothing staged | `gws commit -m "msg" -a` stages everything first |
+| `workspace_unmerged` | `rm` refused: branch commits are not in the base | use `gws apply`, or `gws rm <id> --force` to discard |
 | `workspace_detached` | review/test workspace | report findings; it cannot merge |
 | `workspace_missing` | worktree was deleted | tell the user to recreate it |
 | `workspace_branch_mismatch` | worktree is on another branch | stop; report it |
@@ -85,7 +92,10 @@ Only report success after the envelope's `error` is `null`.
 ## 4. Clean up
 
 - `gws rm <id>` removes a workspace (refuses dirty ones).
-- `gws finish <id>` merges and then cleans up; run it **outside** the workspace.
+- `gws finish [id]` merges and then cleans up. Inside the workspace you can omit
+  the id. In a `gws new`/`gws use` subshell (zsh/bash) it closes automatically and
+  you are back in the main checkout; otherwise `cd` to the repository path it
+  prints before running anything else.
 - Only run `rm`/`finish` when the user asked for cleanup. Never delete a
   workspace that still holds unreported work.
 - `gws gc --dry-run` lists orphans; `gws doctor` self-checks the repository.

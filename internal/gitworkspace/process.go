@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -54,6 +55,32 @@ func (Runner) RunInteractive(ctx context.Context, command Command) error {
 	return cmd.Run()
 }
 
+// ShellMarkerEnv carries the Workspace ID into the interactive subshell gws
+// opens, so gws can tell whether a later command runs inside that subshell.
+const ShellMarkerEnv = "GWS_WORKSPACE_SHELL"
+
+// ShellWrappedEnv marks a subshell whose startup file installed the gws wrapper
+// function. Only then can "gws finish" ask the shell to close itself.
+const ShellWrappedEnv = "GWS_WORKSPACE_WRAPPED"
+
+// ExitWorkspaceShell is the exit code the wrapper function watches for. The user
+// runs "gws finish" inside the subshell; the binary reports this code, the
+// wrapper turns it into "exit 0", and the interactive parent shell resumes in
+// the directory it was in before gws opened the subshell. Interactive shells
+// ignore SIGTERM/SIGHUP, so a signal cannot do this.
+const ExitWorkspaceShell = 42
+
+const workspaceShellFunction = `
+gws() {
+  command gws "$@"
+  local gws_status=$?
+  if [ "$gws_status" -eq %d ]; then
+    exit 0
+  fi
+  return "$gws_status"
+}
+`
+
 func (a *App) LaunchShell(ctx context.Context, workspace Workspace, stdin io.Reader, stdout, stderr io.Writer) error {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -67,10 +94,64 @@ func (a *App) LaunchShell(ctx context.Context, workspace Workspace, stdin io.Rea
 	if _, err := exec.LookPath(shellPath); err != nil {
 		return NewError("shell_unavailable", fmt.Sprintf("Shell %q is not available.", shellPath))
 	}
-	if err := (Runner{}).RunInteractive(ctx, Command{Path: shellPath, Args: shellArgs, Dir: workspace.WorktreePath, Stdin: stdin, Stdout: stdout, Stderr: stderr}); err != nil {
+	env := append(os.Environ(), ShellMarkerEnv+"="+workspace.ID)
+	cleanup, wrapped := prepareShellStartup(filepath.Base(shellPath), &env, &shellArgs)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if wrapped {
+		env = append(env, ShellWrappedEnv+"=1")
+	}
+	err := (Runner{}).RunInteractive(ctx, Command{Path: shellPath, Args: shellArgs, Dir: workspace.WorktreePath, Env: env, Stdin: stdin, Stdout: stdout, Stderr: stderr})
+	if err != nil {
 		return WrapError("external_command_failed", "Workspace shell failed.", err)
 	}
 	return nil
+}
+
+// prepareShellStartup adds the gws wrapper function to an interactive shell by
+// pointing it at a generated startup file that first sources the user's own
+// configuration. Unsupported shells keep their plain startup and simply cannot
+// close themselves, in which case finish prints the directory to cd into.
+func prepareShellStartup(shellName string, env *[]string, args *[]string) (func(), bool) {
+	source := fmt.Sprintf(workspaceShellFunction, ExitWorkspaceShell)
+	switch shellName {
+	case "zsh", "-zsh":
+		zdotdir := os.Getenv("ZDOTDIR")
+		if zdotdir == "" {
+			zdotdir = os.Getenv("HOME")
+		}
+		dir, err := os.MkdirTemp("", "gws-zsh-")
+		if err != nil {
+			return nil, false
+		}
+		content := fmt.Sprintf("GWS_USER_ZDOTDIR=%q\nif [ -f \"$GWS_USER_ZDOTDIR/.zshrc\" ]; then source \"$GWS_USER_ZDOTDIR/.zshrc\"; fi\nunset GWS_USER_ZDOTDIR\n%s", zdotdir, source)
+		if err := os.WriteFile(filepath.Join(dir, ".zshrc"), []byte(content), 0o600); err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, false
+		}
+		*env = append(*env, "ZDOTDIR="+dir)
+		return func() { _ = os.RemoveAll(dir) }, true
+	case "bash", "-bash":
+		rcfile := os.Getenv("GWS_USER_BASHRC")
+		if rcfile == "" {
+			rcfile = filepath.Join(os.Getenv("HOME"), ".bashrc")
+		}
+		dir, err := os.MkdirTemp("", "gws-bash-")
+		if err != nil {
+			return nil, false
+		}
+		path := filepath.Join(dir, "bashrc")
+		content := fmt.Sprintf("if [ -f %q ]; then source %q; fi\n%s", rcfile, rcfile, source)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, false
+		}
+		*args = append(*args, "--rcfile", path)
+		return func() { _ = os.RemoveAll(dir) }, true
+	default:
+		return nil, false
+	}
 }
 
 func truncate(value string, max int) string {

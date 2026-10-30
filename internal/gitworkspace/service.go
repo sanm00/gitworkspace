@@ -50,7 +50,7 @@ var shaPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,40}$`)
 
 func (a *App) CreateWorkspace(ctx context.Context, request CreateRequest) (workspace Workspace, err error) {
 	err = a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
-		repoPath := a.Repo.Root
+		repoPath := a.Repo.RepoPath()
 		if !a.Git.HasCommits(ctx, repoPath) {
 			return NewError("git_ref_not_found", "This repository has no commits. Create an initial commit (for example: git commit --allow-empty -m \"Initial commit\"), then retry.")
 		}
@@ -303,6 +303,8 @@ func (a *App) removeWorkspaceUnlocked(ctx context.Context, workspace Workspace, 
 	if err := a.guardWorktreePath(workspace); err != nil {
 		return err
 	}
+	repoPath := a.Repo.RepoPath()
+	registered := a.Git.IsWorktree(ctx, workspace.WorktreePath)
 	if pathIsDir(workspace.WorktreePath) {
 		dirty, err := a.Git.IsDirty(ctx, workspace.WorktreePath)
 		if err != nil {
@@ -312,27 +314,62 @@ func (a *App) removeWorkspaceUnlocked(ctx context.Context, workspace Workspace, 
 			return NewError("workspace_dirty", "Workspace has uncommitted changes. Inspect it with gws status or use --force to discard it.")
 		}
 	}
+	if workspace.Source.Managed && !force {
+		if unmerged, err := a.unmergedCommitCount(ctx, workspace); err == nil && unmerged > 0 {
+			return NewError("workspace_unmerged", fmt.Sprintf("Workspace branch %s has %d commit(s) that are not in its base. Merge them with gws apply, or discard them with gws rm %s --force.", workspace.Source.Ref, unmerged, workspace.ID))
+		}
+	}
 	workspace.State, workspace.UpdatedAt = StateRemoving, a.Now()
 	if err := a.Store.SaveWorkspace(workspace); err != nil {
 		return err
 	}
-	if err := a.Git.RemoveWorktree(ctx, a.Repo.Root, workspace.WorktreePath, force); err != nil {
-		workspace.State, workspace.LastError = StateError, err.Error()
-		_ = a.Store.SaveWorkspace(workspace)
-		return err
+	if registered {
+		if err := a.Git.RemoveWorktree(ctx, repoPath, workspace.WorktreePath, force); err != nil {
+			workspace.State, workspace.LastError = StateError, err.Error()
+			_ = a.Store.SaveWorkspace(workspace)
+			return err
+		}
 	}
-	_ = a.Git.Prune(ctx, a.Repo.Root)
+	_ = a.Git.Prune(ctx, repoPath)
+	a.removeEmptyWorktreePath(workspace.WorktreePath)
 	if err := removeIfExists(workspace.TaskFilePath); err != nil {
 		return err
 	}
-	if workspace.Source.Managed {
-		if a.Git.RefExists(ctx, a.Repo.Root, workspace.Source.Ref) {
-			if err := a.Git.DeleteBranch(ctx, a.Repo.Root, workspace.Source.Ref, force); err != nil {
-				return WrapError("cleanup_branch_failed", fmt.Sprintf("Workspace worktree was removed, but managed branch %s could not be deleted.", workspace.Source.Ref), err)
-			}
+	if workspace.Source.Managed && a.Git.RefExists(ctx, repoPath, workspace.Source.Ref) {
+		if err := a.Git.DeleteBranch(ctx, repoPath, workspace.Source.Ref, true); err != nil {
+			return WrapError("cleanup_branch_failed", fmt.Sprintf("Workspace worktree was removed, but managed branch %s could not be deleted.", workspace.Source.Ref), err)
 		}
 	}
 	return a.Store.DeleteWorkspace(workspace.ID)
+}
+
+func (a *App) unmergedCommitCount(ctx context.Context, workspace Workspace) (int, error) {
+	repoPath := a.Repo.RepoPath()
+	if workspace.Source.Ref == "" || !a.Git.RefExists(ctx, repoPath, workspace.Source.Ref) {
+		return 0, nil
+	}
+	target := workspace.Source.BaseRef
+	if target == "" || !a.Git.IsBranch(ctx, repoPath, target) {
+		return 0, nil
+	}
+	return a.Git.CountCommits(ctx, repoPath, target+".."+workspace.Source.Ref)
+}
+
+func (a *App) removeEmptyWorktreePath(worktreePath string) {
+	root := a.Paths.WorktreesDir
+	if resolved, err := canonical(root); err == nil {
+		root = resolved
+	}
+	targets := []string{root}
+	if worktreePath != "" {
+		targets = append([]string{worktreePath}, targets...)
+	}
+	for _, dir := range targets {
+		if resolved, err := canonical(dir); err == nil {
+			dir = resolved
+		}
+		_ = os.Remove(dir)
+	}
 }
 
 type ApplyRequest struct {
@@ -358,16 +395,12 @@ func (a *App) FinishWorkspace(ctx context.Context, selector, into, cwd string) (
 		if resolveErr != nil {
 			return resolveErr
 		}
-		canonicalCWD, canonicalErr := canonical(cwd)
-		canonicalWorktree, worktreeErr := canonical(workspace.WorktreePath)
-		if canonicalErr == nil && worktreeErr == nil && isWithin(canonicalCWD, canonicalWorktree, false) {
-			return NewError("workspace_in_use", fmt.Sprintf("Exit Workspace %s first, then run gws finish %s from the original repository.", workspace.Name, workspace.ID))
-		}
 		result, resolveErr = a.applyWorkspaceUnlocked(ctx, workspace, into)
 		if resolveErr != nil {
 			return resolveErr
 		}
-		if removeErr := a.removeWorkspaceUnlocked(ctx, workspace, false); removeErr != nil {
+		result.CWDInside = cwdInside(cwd, workspace.WorktreePath)
+		if removeErr := a.removeWorkspaceUnlocked(ctx, workspace, true); removeErr != nil {
 			return WrapError("finish_cleanup_failed", fmt.Sprintf("Changes were applied to %s, but Workspace cleanup failed. The source branch was preserved.", result.TargetBranch), removeErr)
 		}
 		return nil
@@ -375,8 +408,18 @@ func (a *App) FinishWorkspace(ctx context.Context, selector, into, cwd string) (
 	return
 }
 
+func cwdInside(cwd, worktreePath string) bool {
+	canonicalCWD, cwdErr := canonical(cwd)
+	canonicalWorktree, worktreeErr := canonical(worktreePath)
+	if cwdErr != nil || worktreeErr != nil {
+		return false
+	}
+	return isWithin(canonicalCWD, canonicalWorktree, false)
+}
+
 func (a *App) applyWorkspaceUnlocked(ctx context.Context, workspace Workspace, into string) (result ApplyResult, err error) {
-	result = ApplyResult{Workspace: workspace, RepoRoot: a.Repo.Root, SourceBranch: workspace.Source.Ref}
+	repoPath := a.Repo.RepoPath()
+	result = ApplyResult{Workspace: workspace, RepoRoot: repoPath, SourceBranch: workspace.Source.Ref}
 	fail := func(code, message string) (ApplyResult, error) {
 		err := NewError(code, message)
 		err.Details["workspace_id"] = workspace.ID
@@ -412,7 +455,7 @@ func (a *App) applyWorkspaceUnlocked(ctx context.Context, workspace Workspace, i
 		target = workspace.Source.BaseRef
 	}
 	explicit := into != ""
-	if shaPattern.MatchString(target) && !a.Git.IsBranch(ctx, a.Repo.Root, target) {
+	if shaPattern.MatchString(target) && !a.Git.IsBranch(ctx, repoPath, target) {
 		if !explicit {
 			return fail("apply_sha_target", fmt.Sprintf("Base %q is a commit SHA, not a branch; it cannot receive a merge. Pass a branch with --into <branch>.", target))
 		}
@@ -421,11 +464,11 @@ func (a *App) applyWorkspaceUnlocked(ctx context.Context, workspace Workspace, i
 	if target == result.SourceBranch {
 		return fail("apply_same_branch", "Source and target are the same branch; there is nothing to apply.")
 	}
-	if !a.Git.RefExists(ctx, a.Repo.Root, target) {
+	if !a.Git.RefExists(ctx, repoPath, target) {
 		return fail("git_ref_not_found", fmt.Sprintf("Target branch %q does not exist.", target))
 	}
 
-	mainTree, err := a.Git.MainWorktree(ctx, a.Repo.Root)
+	mainTree, err := a.Git.MainWorktree(ctx, repoPath)
 	if err != nil {
 		return result, err
 	}
@@ -465,7 +508,7 @@ func (a *App) Status(ctx context.Context, selector, cwd string) (status Status, 
 			return resolveErr
 		}
 		status.Workspace = workspace
-		status.RepoRoot = a.Repo.Root
+		status.RepoRoot = a.Repo.RepoPath()
 		status.WorktreeExists = pathIsDir(workspace.WorktreePath)
 		status.TaskExists = pathIsFile(workspace.TaskFilePath)
 		if status.WorktreeExists {
@@ -489,7 +532,7 @@ func (a *App) baseCommitFor(ctx context.Context, workspace Workspace) (string, e
 	if ref == "" {
 		return "", NewError("git_ref_not_found", fmt.Sprintf("Workspace %s has no recorded base commit. Run gws show %s.", workspace.ID, workspace.ID))
 	}
-	return a.Git.ResolveCommit(ctx, a.Repo.Root, ref)
+	return a.Git.ResolveCommit(ctx, a.Repo.RepoPath(), ref)
 }
 
 func (a *App) requireWorktree(workspace Workspace) error {
@@ -567,12 +610,22 @@ func (a *App) CommitWorkspace(ctx context.Context, cwd, message string, all bool
 		if missingErr := a.requireWorktree(workspace); missingErr != nil {
 			return missingErr
 		}
-		dirty, dirtyErr := a.Git.IsDirty(ctx, workspace.WorktreePath)
-		if dirtyErr != nil {
-			return dirtyErr
-		}
-		if !dirty {
-			return NewError("workspace_clean", fmt.Sprintf("Nothing to commit in Workspace %s.", workspace.ID))
+		if all {
+			dirty, dirtyErr := a.Git.IsDirty(ctx, workspace.WorktreePath)
+			if dirtyErr != nil {
+				return dirtyErr
+			}
+			if !dirty {
+				return NewError("workspace_clean", fmt.Sprintf("Nothing to commit in Workspace %s.", workspace.ID))
+			}
+		} else {
+			staged, stagedErr := a.Git.HasStagedChanges(ctx, workspace.WorktreePath)
+			if stagedErr != nil {
+				return stagedErr
+			}
+			if !staged {
+				return NewError("workspace_nothing_staged", fmt.Sprintf("Nothing is staged in Workspace %s. Stage changes with git add, or run gws commit --all to commit every change, including new files.", workspace.ID))
+			}
 		}
 		if commitErr := a.Git.Commit(ctx, workspace.WorktreePath, message, all); commitErr != nil {
 			return commitErr
@@ -644,6 +697,9 @@ func (a *App) GC(ctx context.Context, dryRun bool) (actions []GCAction, err erro
 			}
 		}
 		sort.Slice(actions, func(i, j int) bool { return actions[i].Path < actions[j].Path })
+		if !dryRun {
+			a.removeEmptyWorktreePath("")
+		}
 		return nil
 	})
 	return
@@ -659,9 +715,9 @@ func (a *App) guardWorktreePath(workspace Workspace) error {
 		return err
 	}
 	expected, _ := canonical(a.Paths.WorktreePath(workspace.ID))
-	repo, _ := canonical(a.Repo.Root)
-	parent, _ := canonical(filepath.Dir(repo))
-	if target != expected || target == root || target == repo || target == parent || !isWithin(target, root, true) {
+	stateDir, _ := canonical(a.Paths.StateDir)
+	commonDir, _ := canonical(a.Repo.GitCommonDir)
+	if target != expected || target == root || target == stateDir || target == commonDir || !isWithin(target, root, true) {
 		return NewError("workspace_path_unsafe", fmt.Sprintf("Refusing to remove unsafe Workspace path %s.", target))
 	}
 	if info, lerr := os.Lstat(workspace.WorktreePath); lerr == nil && info.Mode()&os.ModeSymlink != 0 {

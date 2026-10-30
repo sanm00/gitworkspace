@@ -334,6 +334,70 @@ func TestDiffLogAndCommitInsideWorkspace(t *testing.T) {
 	}
 }
 
+func TestFinishFromInsideWorktreeRemovesManagedBranchFromMainCheckout(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "inside-finish", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "inside.txt"), []byte("inside\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, workspace.WorktreePath, "add", "inside.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "inside change")
+
+	insideApp := newTestApp(t, workspace.WorktreePath)
+	if insideApp.Repo.Root == repo {
+		t.Fatalf("test setup expected the app to be detected from the worktree, got %s", insideApp.Repo.Root)
+	}
+	result, err := insideApp.FinishWorkspace(ctx, "", "", workspace.WorktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.CWDInside {
+		t.Fatal("finish from inside the worktree must report cwd_inside")
+	}
+	if app.Git.RefExists(ctx, repo, workspace.Source.Ref) {
+		t.Fatalf("managed branch %s survived finish run from inside the worktree", workspace.Source.Ref)
+	}
+	if !strings.Contains(string(gitCommand(t, repo, "log", "-1", "--pretty=%s")), "inside change") {
+		t.Fatal("main branch did not receive the applied commit")
+	}
+	assertNoGwsArtifacts(t, app, workspace)
+}
+
+func TestCommitAllStagesUntrackedAndBareCommitExplains(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "brand-new.txt"), []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.CommitWorkspace(ctx, workspace.WorktreePath, "auto stage", false); ErrorCode(err) != "workspace_nothing_staged" {
+		t.Fatalf("unstaged untracked file should report workspace_nothing_staged, got %v", err)
+	}
+	committed, err := app.CommitWorkspace(ctx, workspace.WorktreePath, "auto stage", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.Subject != "auto stage" {
+		t.Fatalf("commit result=%#v", committed)
+	}
+	tracked := gitCommand(t, workspace.WorktreePath, "ls-files", "--error-unmatch", "brand-new.txt")
+	if !strings.Contains(tracked, "brand-new.txt") {
+		t.Fatalf("--all did not stage the untracked file: %q", tracked)
+	}
+	if _, err := app.CommitWorkspace(ctx, workspace.WorktreePath, "clean now", true); ErrorCode(err) != "workspace_clean" {
+		t.Fatalf("clean workspace should report workspace_clean, got %v", err)
+	}
+}
+
 func TestDiffAndCommitRequireWorkspaceCWD(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
@@ -470,6 +534,69 @@ func TestApplyConflictPreservesWorkspace(t *testing.T) {
 	gitCommand(t, repo, "merge", "--abort")
 }
 
+func assertNoGwsArtifacts(t *testing.T, app *App, workspace Workspace) {
+	t.Helper()
+	if pathIsDir(workspace.WorktreePath) {
+		t.Fatalf("worktree directory survived release: %s", workspace.WorktreePath)
+	}
+	if pathIsDir(app.Paths.WorktreesDir) {
+		t.Fatalf("empty worktree root survived release: %s", app.Paths.WorktreesDir)
+	}
+	if pathIsFile(workspace.TaskFilePath) {
+		t.Fatalf("task file survived release: %s", workspace.TaskFilePath)
+	}
+	if pathIsFile(app.Paths.WorkspaceFile(workspace.ID)) {
+		t.Fatalf("workspace metadata survived release: %s", app.Paths.WorkspaceFile(workspace.ID))
+	}
+	if workspace.Source.Managed && app.Git.RefExists(context.Background(), app.Repo.Root, workspace.Source.Ref) {
+		t.Fatalf("managed branch survived release: %s", workspace.Source.Ref)
+	}
+}
+
+func TestReleaseRemovesEveryGwsArtifact(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "release", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "release.txt"), []byte("work\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, workspace.WorktreePath, "add", "release.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "unmerged work")
+
+	if err := app.RemoveWorkspace(ctx, workspace.ID, repo, false); ErrorCode(err) != "workspace_unmerged" {
+		t.Fatalf("rm without --force must refuse unmerged work: %v", err)
+	}
+	if err := app.RemoveWorkspace(ctx, workspace.ID, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	assertNoGwsArtifacts(t, app, workspace)
+	if values, err := app.Workspaces(ctx); err != nil || len(values) != 0 {
+		t.Fatalf("workspaces=%#v err=%v", values, err)
+	}
+	if got := strings.TrimSpace(gitCommand(t, repo, "status", "--porcelain")); got != "" {
+		t.Fatalf("release dirtied the main checkout:\n%s", got)
+	}
+}
+
+func TestReleaseCleansWhenWorktreeAlreadyVanished(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "vanished", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, repo, "worktree", "remove", "--force", workspace.WorktreePath)
+	if err := app.RemoveWorkspace(ctx, workspace.ID, repo, false); err != nil {
+		t.Fatal(err)
+	}
+	assertNoGwsArtifacts(t, app, workspace)
+}
+
 func TestFinishMergesAndCleansUp(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
@@ -484,9 +611,28 @@ func TestFinishMergesAndCleansUp(t *testing.T) {
 	gitCommand(t, workspace.WorktreePath, "add", "finish.txt")
 	gitCommand(t, workspace.WorktreePath, "commit", "-m", "finish change")
 
-	if _, err := app.FinishWorkspace(ctx, workspace.ID, "", workspace.WorktreePath); ErrorCode(err) != "workspace_in_use" {
-		t.Fatalf("expected workspace_in_use, got %v", err)
+	inside, err := app.FinishWorkspace(ctx, "", "", workspace.WorktreePath)
+	if err != nil {
+		t.Fatalf("finish from inside the Workspace: %v", err)
 	}
+	if !inside.CWDInside || inside.Workspace.ID != workspace.ID || inside.TargetBranch != "main" {
+		t.Fatalf("finish from inside resolved incorrectly: %#v", inside)
+	}
+	assertNoGwsArtifacts(t, app, workspace)
+	if !pathIsFile(filepath.Join(repo, "finish.txt")) {
+		t.Fatal("finish from inside the Workspace did not apply the change")
+	}
+	recreated, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "finish", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace = recreated
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "finish.txt"), []byte("again\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, workspace.WorktreePath, "add", "finish.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "finish change again")
+
 	result, err := app.FinishWorkspace(ctx, workspace.ID, "", repo)
 	if err != nil {
 		t.Fatal(err)
@@ -497,6 +643,7 @@ func TestFinishMergesAndCleansUp(t *testing.T) {
 	if !pathIsFile(filepath.Join(repo, "finish.txt")) || app.Git.RefExists(ctx, repo, workspace.Source.Ref) {
 		t.Fatal("finish must merge and delete its managed branch")
 	}
+	assertNoGwsArtifacts(t, app, workspace)
 	repeated, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "finish", Base: "main"})
 	if err != nil {
 		t.Fatalf("reuse finished name: %v", err)
@@ -605,7 +752,7 @@ func TestApplyFromNonReadyWorkspaceReportsState(t *testing.T) {
 	}
 }
 
-func TestWorktreeLayoutIsSiblingDirectory(t *testing.T) {
+func TestWorktreeLayoutLivesInsideGitDir(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
 	app := newTestApp(t, repo)
@@ -613,15 +760,22 @@ func TestWorktreeLayoutIsSiblingDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := filepath.Join(filepath.Dir(repo), "repo-gws", workspace.ID)
-	if !strings.HasSuffix(filepath.Clean(workspace.WorktreePath), strings.TrimPrefix(expected, "/")) {
-		t.Fatalf("worktree path=%q expected suffix=%q", workspace.WorktreePath, expected)
+	repoCanonical, _ := canonical(repo)
+	expected := filepath.Join(repoCanonical, ".git", "gws", "worktrees", workspace.ID)
+	got, err := canonical(workspace.WorktreePath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if filepath.Base(filepath.Dir(workspace.WorktreePath)) != "repo-gws" {
-		t.Fatalf("worktree is not in a sibling <repo>-gws directory: %s", workspace.WorktreePath)
+	if got != expected {
+		t.Fatalf("worktree path=%q expected=%q", got, expected)
+	}
+	if got := strings.TrimSpace(gitCommand(t, repo, "status", "--porcelain")); got != "" {
+		t.Fatalf("creating a worktree dirtied the main checkout:\n%s", got)
+	}
+	if filepath.Dir(expected) == repoCanonical {
+		t.Fatalf("worktree must not sit in the repository root: %s", expected)
 	}
 	stateFiles := []string{app.Paths.ConfigFile(), app.Paths.WorkspaceFile(workspace.ID), app.Paths.TaskFile(workspace.ID), app.Paths.LockFile()}
-	repoCanonical, _ := canonical(repo)
 	for _, file := range stateFiles {
 		if !strings.HasPrefix(file, filepath.Join(repoCanonical, ".git", "gws")) {
 			t.Fatalf("state file escaped .git/gws: %s", file)

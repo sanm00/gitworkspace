@@ -149,7 +149,7 @@ gws status [WORKSPACE]
 gws path [WORKSPACE]
 gws diff [WORKSPACE] [--staged] [--stat] [--uncommitted]
 gws log [WORKSPACE] [--limit N] [--stat]
-gws commit --message MESSAGE [--all]
+gws commit --message MESSAGE [-a|--all]
 ```
 
 `diff`, `log`, and `commit` are thin wrappers that resolve the Workspace from
@@ -162,10 +162,12 @@ repeat the path or look up the base commit:
   Because Git never reports untracked files in a diff, they are listed
   separately.
 - `log` prints `git log --oneline <base_commit>..HEAD`, limited by `--limit`.
-- `commit` runs `git commit -m` inside the Workspace, with `--all` mapping to
-  `-a` (tracked files only). It refuses detached review/test Workspaces, stays
-  read-only otherwise, and reports an empty message or a clean worktree as
-  errors instead of prompting.
+- `commit` runs `git commit -m` inside the Workspace. `--all` (`-a`) stages
+  every change first with `git add -A`, including untracked files, then commits;
+  without it only pre-staged changes are committed and an empty index is reported
+  as `workspace_nothing_staged` with a hint to use `--all`, instead of surfacing
+  a raw Git failure. It refuses detached review/test Workspaces and reports an
+  empty message as an error instead of prompting.
 
 These commands only read Git state apart from `commit`, which never changes
 Workspace metadata.
@@ -182,21 +184,32 @@ Inside a managed worktree, an omitted Workspace selector resolves from `cwd`.
 
 ```text
 gws apply [--into BRANCH]
-gws finish WORKSPACE [--into BRANCH]
+gws finish [WORKSPACE] [--into BRANCH]
 ```
 
 `apply` must run from inside the Workspace; the selector is always resolved
 from `cwd` and positional arguments are rejected. Its merge target is the
 recorded base branch, overridden by `--into <branch>`.
 
-`finish` runs from the main checkout (outside the Workspace), applies with the
+`finish` may run from the main checkout or from inside the Workspace. Inside a
+Workspace the positional argument is optional and defaults to that Workspace, and
+the result reports `cwd_inside`.
+A subshell launched by `new`/`use` carries `GWS_WORKSPACE_SHELL=<id>`; when it
+also sets `GWS_WORKSPACE_WRAPPED=1` (zsh and bash), `LaunchShell` points the shell
+at a generated startup file that sources the user's own rc and then defines a
+`gws` wrapper function. A successful in-place `finish` returns the sentinel exit
+code `42`; the wrapper turns it into `exit 0`, so the subshell closes and the
+interactive parent resumes in its original directory. Signals cannot do this
+because interactive shells ignore `SIGTERM`/`SIGHUP`, and a child process cannot
+change its parent shell's directory. Without the wrapper (other shells, `--json`,
+or invoking the binary by absolute path) the CLI prints the `cd` command instead. It applies with the
 same target rules, and starts cleanup only after merge success. It removes the
 worktree, task metadata, and the managed branch when ownership is recorded.
 
 Both commands validate all preconditions before touching anything and stop
 with a structured blocking reason (`apply_blocked` family):
 
-- not inside a Workspace (apply) / inside the Workspace (finish);
+- not inside a Workspace (apply); `finish` accepts either location;
 - Workspace state is not `ready`;
 - detached review/test Workspace;
 - Workspace worktree dirty, missing, or unregistered;
@@ -218,9 +231,14 @@ gws gc [--dry-run]
 gws doctor
 ```
 
-Normal removal refuses a dirty worktree and deletes the managed branch when
-present. `--force` skips only the dirty check. It never skips canonical-path
-and ownership validation.
+Release removes every artifact `gws` created: the worktree through
+`git worktree remove`, its managed branch, the task file, the Workspace record,
+and the worktree root once it is empty. A vanished but still registered
+worktree is pruned instead of failing the release.
+
+Normal removal refuses a dirty worktree and a managed branch with commits not
+yet merged into its base branch (`workspace_unmerged`). `--force` skips only
+those two checks. It never skips canonical-path and ownership validation.
 
 Garbage collection acts only on resources whose Git Workspace ownership can be
 proven. Unknown resources are reported and preserved; branches are never
@@ -250,7 +268,7 @@ All state lives inside the repository:
 ├── tasks/<id>.md
 └── locks/state.lock
 
-<parent>/<repo>-gws/<id>/    worktree checkout (sibling directory)
+<repo>/.git/gws/worktrees/<id>/    worktree checkout (inside the Git directory)
 ```
 
 Because metadata hangs off the Git common directory, all linked worktrees share
@@ -308,7 +326,7 @@ Every non-interactive lifecycle and inspection command accepts `--json`:
   "command": "path",
   "data": {
     "workspace_id": "avatar-8a10",
-    "path": "/home/user/projects/example-gws/avatar-8a10"
+    "path": "/home/user/projects/example/.git/gws/worktrees/avatar-8a10"
   },
   "error": null
 }

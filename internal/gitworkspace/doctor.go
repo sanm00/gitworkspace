@@ -10,7 +10,7 @@ type DoctorCheck struct {
 
 func (a *App) Doctor(ctx context.Context) (checks []DoctorCheck, err error) {
 	err = a.Locker.WithShared(ctx, func(ctx context.Context) error {
-		checks = append(checks, DoctorCheck{Name: "git", Status: "ok", Message: "repository: " + a.Repo.Root})
+		checks = append(checks, DoctorCheck{Name: "git", Status: "ok", Message: "repository: " + a.Repo.RepoPath()})
 		configPath := a.Paths.ConfigFile()
 		config, configErr := LoadConfig(configPath)
 		if configErr != nil {

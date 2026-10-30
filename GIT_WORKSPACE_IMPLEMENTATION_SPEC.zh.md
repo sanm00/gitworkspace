@@ -121,7 +121,7 @@ gws commit --message MESSAGE [--all]
 
 - `diff` 输出 `git diff <base_commit>`，即本空间相对基线的全部改动（含已提交部分）。`--uncommitted` 改为对比 `HEAD`；`--staged` 对比索引；`--stat` 输出摘要。Git 的 diff 从不包含未跟踪文件，因此这些文件单独列出。
 - `log` 输出 `git log --oneline <base_commit>..HEAD`，`--limit` 限制条数。
-- `commit` 在空间内执行 `git commit -m`，`--all` 对应 `-a`（仅已跟踪文件）。它拒绝 detached 的 review/test 空间，其余情况保持只读语义，空消息或工作区干净都作为错误返回而不进入交互提示。
+- `commit` 在空间内执行 `git commit -m`。`--all`（`-a`）先用 `git add -A` 暂存全部改动（含未跟踪文件）再提交；不带 `--all` 时只提交已暂存内容，索引为空返回 `workspace_nothing_staged` 并提示改用 `--all`，而不是抛出原始 Git 报错。它拒绝 detached 的 review/test 空间，空消息作为错误返回而不进入交互提示。
 
 除 `commit` 外这些命令只读取 Git 状态；`commit` 从不修改 Workspace 元数据。
 
@@ -133,16 +133,16 @@ gws commit --message MESSAGE [--all]
 
 ```text
 gws apply [--into BRANCH]
-gws finish WORKSPACE [--into BRANCH]
+gws finish [WORKSPACE] [--into BRANCH]
 ```
 
 `apply` 必须在 Workspace 内执行；选择器总是由 `cwd` 解析，位置参数会被拒绝。合并目标默认是记录的基线分支，可用 `--into <branch>` 覆盖。
 
-`finish` 在主检出（Workspace 之外）执行，使用相同的目标规则完成 apply，只有合并成功后才开始清理：删除 worktree、任务元数据，以及在记录所有权时删除托管分支。
+`finish` 既可在主检出执行，也可在 Workspace 内执行。在 Workspace 内时位置参数可省略，默认就是当前 Workspace，结果会带上 `cwd_inside`。由 `new`/`use` 启动的子 Shell 带有 `GWS_WORKSPACE_SHELL=<id>`，并在 zsh/bash 下额外设置 `GWS_WORKSPACE_WRAPPED=1`：`LaunchShell` 让 shell 读取一个生成的启动文件，该文件先 source 用户自己的 rc，再定义 `gws` 包装函数。原地 finish 成功会返回哨兵退出码 `42`，包装函数把它转成 `exit 0`，于是子 Shell 关闭、交互 shell 回到原来的目录。不能用信号实现：交互式 shell 会忽略 `SIGTERM`/`SIGHUP`，且子进程无法改变父 shell 的目录。没有该包装（其他 shell、`--json`、或用绝对路径调用二进制）时改为打印需要执行的 `cd`。合并使用与 apply 相同的目标规则，只有成功后才开始清理：删除 worktree、任务元数据，以及在记录所有权时删除托管分支。
 
 两条命令在执行任何改动之前完成全部前置校验，任一不满足即停止并返回结构化的阻塞原因：
 
-- 不在 Workspace 内（apply）/ 仍在被移除的 Workspace 内（finish）；
+- 不在 Workspace 内（apply）；`finish` 两种位置都接受；
 - Workspace 状态不是 `ready`；
 - detached review/test Workspace；
 - Workspace worktree dirty、缺失或未注册；
@@ -162,7 +162,9 @@ gws gc [--dry-run]
 gws doctor
 ```
 
-普通删除拒绝包含未提交修改的 worktree，并在存在所有权记录时删除托管分支。`--force` 只跳过 dirty 检查，绝不跳过规范化路径与所有权校验。
+释放空间会清除 `gws` 创建的全部痕迹：通过 `git worktree remove` 删除检出、删除托管分支、任务文件、Workspace 记录，并在 worktree 根目录为空时一并移除。worktree 已消失但仍注册在 Git 中时执行 prune，而不是让释放失败。
+
+普通删除拒绝包含未提交修改的 worktree，也拒绝尚未合入基线的托管分支提交（`workspace_unmerged`）。`--force` 只跳过这两项检查，绝不跳过规范化路径与所有权校验。
 
 垃圾回收只作用于 Git Workspace 所有权可被证明的资源；未知资源只报告、不删除；`gc` 从不删除分支。`--dry-run` 是推荐的第一步。
 
@@ -185,7 +187,7 @@ Workspace 解析接受精确 ID、精确名称，以及在显式启用时的无�
 ├── tasks/<id>.md
 └── locks/state.lock
 
-<parent>/<repo>-gws/<id>/    worktree 检出目录（同级目录）
+<repo>/.git/gws/worktrees/<id>/    worktree 检出目录（位于 Git 内部目录）
 ```
 
 元数据挂在 Git common 目录下，因此所有 linked worktree 共享一份状态；克隆仓库不会带走任何 `gws` 数据。`config.json` 可选且永不自动生成，唯一字段是兜底的 `default_branch`（HEAD detached 且未给 `--base` 时使用）。
@@ -230,7 +232,7 @@ gws capabilities --json
   "command": "path",
   "data": {
     "workspace_id": "avatar-8a10",
-    "path": "/home/user/projects/example-gws/avatar-8a10"
+    "path": "/home/user/projects/example/.git/gws/worktrees/avatar-8a10"
   },
   "error": null
 }

@@ -49,6 +49,7 @@ type Workspace struct {
 
 type Repository struct {
 	Root          string
+	MainRoot      string
 	GitCommonDir  string
 	CurrentBranch string
 }
@@ -67,6 +68,7 @@ type ApplyResult struct {
 	RepoRoot     string
 	SourceBranch string
 	TargetBranch string
+	CWDInside    bool
 }
 
 type DiffResult struct {
