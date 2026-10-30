@@ -4,7 +4,10 @@ All notable changes to this project will be documented in this file. The project
 uses semantic versioning and keeps incompatible behavior under v0 releases
 explicit in release notes.
 
-## Unreleased
+## v0.1.0 - 2026-10-30
+
+First tagged release. Pre-1.0: CLI, JSON, and persisted-state breaking changes
+are expected between minor versions.
 
 ### Added
 
