@@ -9,13 +9,20 @@ import (
 )
 
 func TestReviewTaskIsInspectionFirst(t *testing.T) {
-	project := Project{Name: "Demo"}
-	workspace := Workspace{Name: "review-a", Type: WorkspaceReview, WorktreePath: "/tmp/w", Source: SourceSpec{Ref: "feature/a", BaseRef: "main"}}
-	text := RenderTask(project, workspace)
-	for _, needle := range []string{"Type: Review", "Target: feature/a", "Base: main", "Do not modify"} {
+	workspace := Workspace{Name: "review-a", Type: WorkspaceReview, WorktreePath: "/tmp/w", Source: SourceSpec{Ref: "feature/a", BaseRef: "main", BaseCommit: "abcdef0123"}}
+	text := RenderTask(workspace)
+	for _, needle := range []string{"Type: Review", "Target: feature/a", "Base: main", "Base commit: abcdef0123", "Do not modify"} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("missing %q in %s", needle, text)
 		}
+	}
+}
+
+func TestTaskFallsBackToFromRef(t *testing.T) {
+	workspace := Workspace{Name: "legacy", Type: WorkspaceDev, WorktreePath: "/tmp/w", Source: SourceSpec{Ref: "feature/a", FromRef: "main"}}
+	text := RenderTask(workspace)
+	if !strings.Contains(text, "Base: main") || !strings.Contains(text, "Base commit: -") {
+		t.Fatalf("legacy fallback missing:\n%s", text)
 	}
 }
 

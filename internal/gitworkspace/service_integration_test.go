@@ -42,31 +42,29 @@ func testRepository(t *testing.T) string {
 	return repo
 }
 
+func newTestApp(t *testing.T, repo string) *App {
+	t.Helper()
+	git := Git{Runner: Runner{}}
+	detected, err := git.DetectRepository(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := NewPaths(detected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	return NewApp(paths, detected)
+}
+
 func TestWorkspaceLifecycle(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, err := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	project, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if project.StateVersion != CurrentStateVersion {
-		t.Fatalf("project state version=%d", project.StateVersion)
-	}
-	if !strings.HasPrefix(project.ID, "demo-") || len(project.ID) != len("demo-")+4 {
-		t.Fatalf("project ID does not have a unique suffix: %q", project.ID)
-	}
-	again, updated, err := app.InitProject(ctx, InitRequest{CWD: repo})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if updated || again.ID != project.ID {
-		t.Fatalf("init not idempotent: updated=%t %#v", updated, again)
-	}
-	review, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceReview, Ref: "feature/b", BaseRef: "main"})
+	app := newTestApp(t, repo)
+
+	review, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceReview, Base: "feature/b"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,17 +74,19 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	if _, err := exec.Command("git", "-C", review.WorktreePath, "symbolic-ref", "--quiet", "HEAD").CombinedOutput(); err == nil {
 		t.Fatal("review worktree is attached")
 	}
-	fromWorktree, _, err := app.InitProject(ctx, InitRequest{CWD: review.WorktreePath})
+	if review.Source.BaseRef != "feature/b" || review.Source.BaseCommit == "" {
+		t.Fatalf("review base was not recorded: %#v", review.Source)
+	}
+	if got := strings.TrimSpace(gitCommand(t, review.WorktreePath, "rev-parse", "HEAD")); got != review.Source.BaseCommit {
+		t.Fatalf("review worktree HEAD=%q base commit=%q", got, review.Source.BaseCommit)
+	}
+
+	dev, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Base: "feature/a"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	canonicalRepo, _ := canonical(repo)
-	if fromWorktree.RepoPath != canonicalRepo || fromWorktree.ConfigPath != filepath.Join(canonicalRepo, ".git-workspace.yaml") {
-		t.Fatalf("original checkout changed: %#v", fromWorktree)
-	}
-	dev, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "feature/a"})
-	if err != nil {
-		t.Fatal(err)
+	if !dev.Source.Managed || !strings.HasPrefix(dev.Source.Ref, "gws/") {
+		t.Fatalf("dev source=%#v", dev.Source)
 	}
 	if got := gitCommand(t, repo, "branch", "--show-current"); got != "main\n" {
 		t.Fatalf("original branch changed: %q", got)
@@ -94,13 +94,16 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dev.WorktreePath, "dirty.txt"), []byte("dirty"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.RemoveWorkspace(ctx, dev.ID, "", repo, false); ErrorCode(err) != "workspace_dirty" {
+	if err := app.RemoveWorkspace(ctx, dev.ID, repo, false); ErrorCode(err) != "workspace_dirty" {
 		t.Fatalf("expected dirty error, got %v", err)
 	}
-	if err := app.RemoveWorkspace(ctx, dev.ID, "", repo, true); err != nil {
+	if err := app.RemoveWorkspace(ctx, dev.ID, repo, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.RemoveWorkspace(ctx, review.ID, "", repo, false); err != nil {
+	if app.Git.RefExists(ctx, repo, dev.Source.Ref) {
+		t.Fatal("rm must delete the managed branch")
+	}
+	if err := app.RemoveWorkspace(ctx, review.ID, repo, false); err != nil {
 		t.Fatal(err)
 	}
 	if !pathIsDir(repo) {
@@ -108,107 +111,90 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	}
 }
 
-func TestProjectResolutionFromWorkspaceCWD(t *testing.T) {
+func TestCreateWorkspaceRecordsBaseForAllTypes(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	project, _, _ := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"})
-	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceReview, Ref: "feature/a"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := app.ResolveProject(ctx, "", workspace.WorktreePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resolved.ID != project.ID {
-		t.Fatalf("project=%s", resolved.ID)
-	}
-}
-
-func TestProjectResolutionErrorUsesCanonicalCommandName(t *testing.T) {
-	app, err := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = app.ResolveProject(context.Background(), "", t.TempDir())
-	if err == nil {
-		t.Fatal("expected project resolution error")
-	}
-	if !strings.Contains(err.Error(), "gws init") {
-		t.Fatalf("unexpected command hint: %v", err)
-	}
-}
-
-func TestCreateWorkspaceMissingStartRefExplainsHowToProceed(t *testing.T) {
-	ctx := context.Background()
-	repo := testRepository(t)
-	app, err := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "missing"}); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "test", FromRef: "missing", New: true})
-	if ErrorCode(err) != "git_ref_not_found" {
-		t.Fatalf("expected missing ref error, got %v", err)
-	}
-	for _, expected := range []string{"--from <ref>", "fetch the ref from a remote"} {
-		if !strings.Contains(err.Error(), expected) {
-			t.Fatalf("error does not explain how to choose a start ref; missing %q: %v", expected, err)
+	app := newTestApp(t, repo)
+	gitCommand(t, repo, "checkout", "feature/a")
+	for _, kind := range []WorkspaceType{WorkspaceDev, WorkspaceFix, WorkspaceReview, WorkspaceTest} {
+		workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: kind})
+		if err != nil {
+			t.Fatalf("type=%s err=%v", kind, err)
+		}
+		if workspace.Source.BaseRef != "feature/a" {
+			t.Fatalf("type=%s base ref=%q", kind, workspace.Source.BaseRef)
+		}
+		if workspace.Source.BaseCommit == "" {
+			t.Fatalf("type=%s base commit is empty", kind)
+		}
+		if want := strings.TrimSpace(gitCommand(t, repo, "rev-parse", "feature/a")); workspace.Source.BaseCommit != want {
+			t.Fatalf("type=%s base commit=%q want=%q", kind, workspace.Source.BaseCommit, want)
 		}
 	}
 }
 
-func TestNewWorkspaceStartsFromCurrentBranch(t *testing.T) {
+func TestCreateWorkspaceDetachedFlagAndAutoName(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-	gitCommand(t, repo, "checkout", "feature/a")
-	gitCommand(t, repo, "branch", "feature/new-command")
-	workspace, err := app.CreateWorkspace(ctx, CreateRequest{
-		CWD:            repo,
-		Type:           WorkspaceDev,
-		Ref:            "feature/new-command",
-		New:            true,
-		FromCurrent:    true,
-		GenerateBranch: true,
-	})
+	app := newTestApp(t, repo)
+	gitCommand(t, repo, "checkout", "feature/b")
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Detach: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if workspace.Source.FromRef != "feature/a" {
-		t.Fatalf("from=%q", workspace.Source.FromRef)
-	}
-	if workspace.Name != "feature-new-command" || !strings.HasPrefix(workspace.ID, "feature-new-command-") {
-		t.Fatalf("workspace name/id lost work-item prefix: name=%q id=%q", workspace.Name, workspace.ID)
-	}
-	if !workspace.Source.Managed || !strings.HasPrefix(workspace.Source.Ref, "gws/") {
+	if !workspace.Source.Detached {
 		t.Fatalf("source=%#v", workspace.Source)
 	}
-	if got := strings.TrimSpace(gitCommand(t, workspace.WorktreePath, "branch", "--show-current")); got != workspace.Source.Ref {
-		t.Fatalf("workspace branch=%q", got)
+	if workspace.Type != WorkspaceDev {
+		t.Fatalf("type=%q", workspace.Type)
 	}
-	base := gitCommand(t, repo, "rev-parse", "feature/a")
-	head := gitCommand(t, workspace.WorktreePath, "rev-parse", "HEAD")
-	if base != head {
-		t.Fatalf("workspace did not start from current branch: base=%q head=%q", base, head)
+	if workspace.Name != "feature-b" {
+		t.Fatalf("auto name=%q", workspace.Name)
+	}
+	if _, err := exec.Command("git", "-C", workspace.WorktreePath, "symbolic-ref", "--quiet", "HEAD").CombinedOutput(); err == nil {
+		t.Fatal("--detach produced an attached worktree")
 	}
 }
 
-func TestSameWorkItemCreatesIndependentWorkspaces(t *testing.T) {
+func TestCreateWorkspaceRejectsUnknownBase(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
+	app := newTestApp(t, repo)
+	_, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Base: "missing-ref"})
+	if ErrorCode(err) != "git_ref_not_found" {
+		t.Fatalf("error=%v", err)
+	}
+	if !strings.Contains(err.Error(), "--base") {
+		t.Fatalf("error does not explain how to proceed: %v", err)
+	}
+}
+
+func TestCreateWorkspaceDetachedHeadNeedsBaseOrDefault(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	commit := strings.TrimSpace(gitCommand(t, repo, "rev-parse", "main"))
+	gitCommand(t, repo, "checkout", "--detach", commit)
+	if _, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo}); ErrorCode(err) != "git_ref_not_found" {
+		t.Fatalf("expected git_ref_not_found, got %v", err)
+	}
+	if err := SaveConfig(app.Paths.ConfigFile(), ProjectConfig{DefaultBranch: "main"}); err != nil {
 		t.Fatal(err)
 	}
-	request := CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "feature/avatar", New: true, FromCurrent: true, GenerateBranch: true}
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Source.BaseRef != "main" {
+		t.Fatalf("base=%q", workspace.Source.BaseRef)
+	}
+}
+
+func TestSameNameCreatesIndependentWorkspaces(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	request := CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "avatar", Base: "main"}
 	first, err := app.CreateWorkspace(ctx, request)
 	if err != nil {
 		t.Fatal(err)
@@ -220,10 +206,10 @@ func TestSameWorkItemCreatesIndependentWorkspaces(t *testing.T) {
 	if first.ID == second.ID || first.Source.Ref == second.Source.Ref || first.WorktreePath == second.WorktreePath {
 		t.Fatalf("workspaces are not independent: first=%#v second=%#v", first, second)
 	}
-	if _, _, err := app.ResolveWorkspace(ctx, "feature-avatar", "", repo, true); ErrorCode(err) != "workspace_ambiguous" {
+	if _, err := app.ResolveWorkspace(ctx, "avatar", repo, true); ErrorCode(err) != "workspace_ambiguous" {
 		t.Fatalf("duplicate name should require an ID: %v", err)
 	}
-	if resolved, _, err := app.ResolveWorkspace(ctx, first.ID, "", repo, true); err != nil || resolved.ID != first.ID {
+	if resolved, err := app.ResolveWorkspace(ctx, first.ID, repo, true); err != nil || resolved.ID != first.ID {
 		t.Fatalf("resolve by ID: workspace=%#v err=%v", resolved, err)
 	}
 }
@@ -231,15 +217,11 @@ func TestSameWorkItemCreatesIndependentWorkspaces(t *testing.T) {
 func TestEmptyWorkspaceSelectorExplainsMissingArgument(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
+	app := newTestApp(t, repo)
+	if _, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Base: "main"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "test", FromRef: "main", New: true, GenerateBranch: true}); err != nil {
-		t.Fatal(err)
-	}
-
-	_, _, err := app.ResolveWorkspace(ctx, "", "", repo, true)
+	_, err := app.ResolveWorkspace(ctx, "", repo, true)
 	if ErrorCode(err) != "workspace_not_found" {
 		t.Fatalf("expected missing Workspace argument, got %v", err)
 	}
@@ -248,276 +230,308 @@ func TestEmptyWorkspaceSelectorExplainsMissingArgument(t *testing.T) {
 	}
 }
 
-func TestApplyWithoutSelectorPrefersWorkspaceContainingCWD(t *testing.T) {
+func TestApplyRequiresWorkspaceCWD(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
+	app := newTestApp(t, repo)
+	if _, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Base: "main"}); err != nil {
 		t.Fatal(err)
 	}
-	first, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "first", FromRef: "main", New: true, GenerateBranch: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "second", FromRef: "main", New: true, GenerateBranch: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(first.WorktreePath, "first.txt"), []byte("first\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitCommand(t, first.WorktreePath, "add", "first.txt")
-	gitCommand(t, first.WorktreePath, "commit", "-m", "first change")
-
-	result, err := app.ApplyWorkspace(ctx, "", "", first.WorktreePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Workspace.ID != first.ID || !pathIsFile(filepath.Join(repo, "first.txt")) {
-		t.Fatalf("apply selected the wrong Workspace: %#v", result)
+	_, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: repo})
+	if ErrorCode(err) != "workspace_not_found" {
+		t.Fatalf("apply outside a workspace must fail, got %v", err)
 	}
 }
 
-func TestApplyWithoutSelectorUsesOnlyCurrentProjectsApplicableWorkspaces(t *testing.T) {
-	ctx := context.Background()
-	repoA := testRepository(t)
-	repoB := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repoA, Name: "Project A", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repoB, Name: "Project B", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repoA, Type: WorkspaceDev, Ref: "other-project", FromRef: "main", New: true, GenerateBranch: true}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := app.ApplyWorkspace(ctx, "", "", repoB); ErrorCode(err) != "workspace_not_found" {
-		t.Fatalf("apply crossed Project boundaries: %v", err)
-	}
-
-	dev, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repoB, Type: WorkspaceDev, Ref: "applicable", FromRef: "main", New: true, GenerateBranch: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repoB, Type: WorkspaceReview, Ref: "feature/a", BaseRef: "main"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dev.WorktreePath, "applicable.txt"), []byte("applicable\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitCommand(t, dev.WorktreePath, "add", "applicable.txt")
-	gitCommand(t, dev.WorktreePath, "commit", "-m", "applicable change")
-
-	result, err := app.ApplyWorkspace(ctx, "", "", repoB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Workspace.ID != dev.ID {
-		t.Fatalf("apply did not select the sole applicable Workspace: %#v", result)
-	}
-}
-
-func TestApplyWithoutSelectorReportsCurrentProjectCandidates(t *testing.T) {
+func TestApplyMergesIntoBase(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-	first, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "first", FromRef: "main", New: true, GenerateBranch: true})
+	app := newTestApp(t, repo)
+	gitCommand(t, repo, "checkout", "feature/a")
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "first"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "second", FromRef: "main", New: true, GenerateBranch: true})
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "first.txt"), []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, workspace.WorktreePath, "add", "first.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "first change")
+
+	result, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	_, err = app.ApplyWorkspace(ctx, "", "", repo)
-	if ErrorCode(err) != "workspace_ambiguous" {
-		t.Fatalf("expected current-Project ambiguity, got %v", err)
-	}
-	if !strings.Contains(err.Error(), first.ID) || !strings.Contains(err.Error(), second.ID) || !strings.Contains(err.Error(), "gws apply <workspace-id>") {
-		t.Fatalf("ambiguity error is not actionable: %v", err)
-	}
-	candidates, ok := ErrorDetails(err)["candidates"].([]Workspace)
-	if !ok || len(candidates) != 2 {
-		t.Fatalf("unexpected candidates: %#v", ErrorDetails(err)["candidates"])
-	}
-	ids := map[string]bool{candidates[0].ID: true, candidates[1].ID: true}
-	if !ids[first.ID] || !ids[second.ID] {
-		t.Fatalf("wrong candidates: %#v", candidates)
-	}
-}
-
-func TestRemoveWorkspaceIsScopedToCurrentProjectUnlessExplicit(t *testing.T) {
-	ctx := context.Background()
-	repoA := testRepository(t)
-	repoB := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repoA, Name: "Project A", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-	projectB, _, err := app.InitProject(ctx, InitRequest{CWD: repoB, Name: "Project B", DefaultBranch: "main"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	workspaceB, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repoB, Type: WorkspaceDev, Ref: "foreign", FromCurrent: true, New: true, GenerateBranch: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := app.RemoveWorkspace(ctx, workspaceB.ID, "", repoA, false); ErrorCode(err) != "workspace_not_found" {
-		t.Fatalf("cross-project removal without --project should fail with workspace_not_found, got %v", err)
-	}
-	if !pathIsDir(workspaceB.WorktreePath) {
-		t.Fatal("cross-project removal deleted the Workspace")
-	}
-	if err := app.RemoveWorkspace(ctx, workspaceB.ID, projectB.ID, repoA, false); err != nil {
-		t.Fatalf("explicit project removal failed: %v", err)
-	}
-	if pathIsDir(workspaceB.WorktreePath) {
-		t.Fatal("explicit project removal preserved the Workspace")
-	}
-}
-
-func TestApplyAndFinishWorkspace(t *testing.T) {
-	ctx := context.Background()
-	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-
-	applyWorkspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "feature/apply", FromRef: "main", New: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(applyWorkspace.WorktreePath, "apply.txt"), []byte("applied\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitCommand(t, applyWorkspace.WorktreePath, "add", "apply.txt")
-	gitCommand(t, applyWorkspace.WorktreePath, "commit", "-m", "apply change")
-
-	// Create the second Workspace before applying the first one so both branches
-	// share the same base and the second integration exercises a real merge.
-	finishWorkspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "finish", FromRef: "main", New: true, GenerateBranch: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(finishWorkspace.WorktreePath, "finish.txt"), []byte("finished\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gitCommand(t, finishWorkspace.WorktreePath, "add", "finish.txt")
-	gitCommand(t, finishWorkspace.WorktreePath, "commit", "-m", "finish change")
-
-	result, err := app.ApplyWorkspace(ctx, applyWorkspace.ID, "", repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.SourceBranch != "feature/apply" || result.TargetBranch != "main" {
+	if result.Workspace.ID != workspace.ID || result.TargetBranch != "feature/a" {
 		t.Fatalf("result=%#v", result)
 	}
-	if !pathIsFile(filepath.Join(repo, "apply.txt")) || !pathIsDir(applyWorkspace.WorktreePath) {
-		t.Fatal("apply must merge changes without removing the Workspace")
+	if !pathIsFile(filepath.Join(repo, "first.txt")) {
+		t.Fatal("apply did not merge into the base branch checkout")
 	}
-
-	finished, err := app.FinishWorkspace(ctx, finishWorkspace.ID, "", repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if finished.TargetBranch != "main" || pathIsDir(finishWorkspace.WorktreePath) {
-		t.Fatalf("unexpected finish result=%#v path_exists=%t", finished, pathIsDir(finishWorkspace.WorktreePath))
-	}
-	if !pathIsFile(filepath.Join(repo, "finish.txt")) || app.Git.RefExists(ctx, repo, finishWorkspace.Source.Ref) {
-		t.Fatal("finish must merge the change and delete its managed source branch")
-	}
-	repeated, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "finish", FromRef: "main", New: true, GenerateBranch: true})
-	if err != nil {
-		t.Fatalf("reuse finished work-item name: %v", err)
-	}
-	if repeated.Name != finishWorkspace.Name || repeated.Source.Ref == finishWorkspace.Source.Ref {
-		t.Fatalf("repeated workspace did not receive a fresh managed branch: old=%#v new=%#v", finishWorkspace, repeated)
+	if !pathIsDir(workspace.WorktreePath) {
+		t.Fatal("apply must not remove the Workspace")
 	}
 }
 
-func TestApplySafetyFailuresPreserveWorkspace(t *testing.T) {
+func TestDiffLogAndCommitInsideWorkspace(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-
-	dirty, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "feature/dirty", FromRef: "main", New: true})
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Base: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dirty.WorktreePath, "dirty.txt"), []byte("not committed\n"), 0o600); err != nil {
+	if _, err := app.DiffWorkspace(ctx, workspace.ID, repo, false, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.ApplyWorkspace(ctx, dirty.ID, "", repo); ErrorCode(err) != "workspace_dirty" {
+	if _, err := app.CommitWorkspace(ctx, workspace.WorktreePath, "empty", true); ErrorCode(err) != "workspace_clean" {
+		t.Fatalf("commit of clean workspace error=%v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "README.md"), []byte("changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	diff, err := app.DiffWorkspace(ctx, workspace.ID, repo, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(diff.Content, "changed") || diff.Base != workspace.Source.BaseCommit {
+		t.Fatalf("diff=%#v", diff)
+	}
+	if log, err := app.LogWorkspace(ctx, workspace.ID, repo, 0, false); err != nil || strings.TrimSpace(log.Content) != "" {
+		t.Fatalf("log before commit=%#v err=%v", log, err)
+	}
+	committed, err := app.CommitWorkspace(ctx, workspace.WorktreePath, "tweak readme", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.Subject != "tweak readme" || committed.Commit == "" {
+		t.Fatalf("commit result=%#v", committed)
+	}
+	log, err := app.LogWorkspace(ctx, workspace.ID, repo, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(log.Content, "tweak readme") {
+		t.Fatalf("log after commit=%q", log.Content)
+	}
+	uncommitted, err := app.DiffWorkspace(ctx, workspace.ID, repo, false, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(uncommitted.Content) != "" || uncommitted.Base != "HEAD" {
+		t.Fatalf("uncommitted diff=%#v", uncommitted)
+	}
+
+	review, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceReview, Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(review.WorktreePath, "README.md"), []byte("review\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.CommitWorkspace(ctx, review.WorktreePath, "nope", true); ErrorCode(err) != "workspace_detached" {
+		t.Fatalf("detached commit error=%v", err)
+	}
+}
+
+func TestDiffAndCommitRequireWorkspaceCWD(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	if _, err := app.DiffWorkspace(ctx, "", repo, false, false, false); ErrorCode(err) != "workspace_not_found" {
+		t.Fatalf("diff error=%v", err)
+	}
+	if _, err := app.CommitWorkspace(ctx, repo, "msg", false); ErrorCode(err) != "workspace_not_found" {
+		t.Fatalf("commit error=%v", err)
+	}
+}
+
+func TestApplyBlockedWhenMainCheckoutOnOtherBranch(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	gitCommand(t, repo, "checkout", "feature/a")
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "blocked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "x.txt"), []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, workspace.WorktreePath, "add", "x.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "x")
+	gitCommand(t, repo, "checkout", "main")
+
+	_, err = app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath})
+	if ErrorCode(err) != "apply_target_not_checked_out" {
+		t.Fatalf("expected apply_target_not_checked_out, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "feature/a") || !strings.Contains(err.Error(), "--into") {
+		t.Fatalf("blocking message is not actionable: %v", err)
+	}
+	if pathIsFile(filepath.Join(repo, "x.txt")) {
+		t.Fatal("blocked apply merged changes")
+	}
+
+	result, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath, Into: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TargetBranch != "main" || !pathIsFile(filepath.Join(repo, "x.txt")) {
+		t.Fatalf("--into apply result=%#v", result)
+	}
+}
+
+func TestApplyBlockedOnSHABase(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	commit := strings.TrimSpace(gitCommand(t, repo, "rev-parse", "main"))
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "sha", Base: commit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "s.txt"), []byte("s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, workspace.WorktreePath, "add", "s.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "s")
+	_, err = app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath})
+	if ErrorCode(err) != "apply_sha_target" {
+		t.Fatalf("expected apply_sha_target, got %v", err)
+	}
+	if _, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath, Into: "nope"}); ErrorCode(err) != "git_ref_not_found" {
+		t.Fatalf("expected git_ref_not_found for unknown --into, got %v", err)
+	}
+}
+
+func TestApplyBlockedOnDirtyWorkspaceAndDirtyTarget(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "dirty", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "d.txt"), []byte("d\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath}); ErrorCode(err) != "workspace_dirty" {
 		t.Fatalf("expected workspace_dirty, got %v", err)
 	}
-	if !pathIsDir(dirty.WorktreePath) {
-		t.Fatal("failed apply removed Workspace")
-	}
-	if _, err := app.FinishWorkspace(ctx, dirty.ID, "", dirty.WorktreePath); ErrorCode(err) != "workspace_in_use" {
-		t.Fatalf("expected workspace_in_use, got %v", err)
-	}
-	if !pathIsDir(dirty.WorktreePath) {
-		t.Fatal("failed finish removed Workspace")
-	}
-
-	review, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceReview, Ref: "feature/b", BaseRef: "main"})
-	if err != nil {
+	gitCommand(t, workspace.WorktreePath, "add", "d.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "d")
+	if err := os.WriteFile(filepath.Join(repo, "local.txt"), []byte("local\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.ApplyWorkspace(ctx, review.ID, "", repo); ErrorCode(err) != "workspace_detached" {
-		t.Fatalf("expected workspace_detached, got %v", err)
+	if _, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath}); ErrorCode(err) != "target_dirty" {
+		t.Fatalf("expected target_dirty, got %v", err)
 	}
-	if !pathIsDir(review.WorktreePath) {
-		t.Fatal("failed detached apply removed Workspace")
+	if err := os.Remove(filepath.Join(repo, "local.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath}); err != nil {
+		t.Fatalf("apply after cleaning target: %v", err)
 	}
 }
 
-func TestInitPropagatesRegistrationConfigChanges(t *testing.T) {
+func TestApplyConflictPreservesWorkspace(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	configPath := filepath.Join(repo, ".git-workspace.yaml")
-	if err := os.WriteFile(configPath, []byte("version: 1\nproject:\n  name: First\n  default_branch: main\n"), 0o600); err != nil {
+	app := newTestApp(t, repo)
+	if err := os.WriteFile(filepath.Join(repo, "conflict.txt"), []byte("base\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	first, _, err := app.InitProject(ctx, InitRequest{CWD: repo})
+	gitCommand(t, repo, "add", "conflict.txt")
+	gitCommand(t, repo, "commit", "-m", "base conflict file")
+
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "conflict", Base: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(configPath, []byte("version: 1\nproject:\n  name: Second\n  default_branch: main\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "conflict.txt"), []byte("side A\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	second, updated, err := app.InitProject(ctx, InitRequest{CWD: repo})
+	gitCommand(t, workspace.WorktreePath, "add", "conflict.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "side A")
+	if err := os.WriteFile(filepath.Join(repo, "conflict.txt"), []byte("side B\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, repo, "add", "conflict.txt")
+	gitCommand(t, repo, "commit", "-m", "side B")
+
+	_, err = app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath})
+	if ErrorCode(err) != "merge_conflict" {
+		t.Fatalf("expected merge_conflict, got %v", err)
+	}
+	if !pathIsDir(workspace.WorktreePath) {
+		t.Fatal("conflicting apply removed the Workspace")
+	}
+	gitCommand(t, repo, "merge", "--abort")
+}
+
+func TestFinishMergesAndCleansUp(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "finish", Base: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !updated || second.ID != first.ID || second.Name != "Second" {
-		t.Fatalf("unexpected update: %#v updated=%t", second, updated)
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "finish.txt"), []byte("finished\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, workspace.WorktreePath, "add", "finish.txt")
+	gitCommand(t, workspace.WorktreePath, "commit", "-m", "finish change")
+
+	if _, err := app.FinishWorkspace(ctx, workspace.ID, "", workspace.WorktreePath); ErrorCode(err) != "workspace_in_use" {
+		t.Fatalf("expected workspace_in_use, got %v", err)
+	}
+	result, err := app.FinishWorkspace(ctx, workspace.ID, "", repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TargetBranch != "main" || pathIsDir(workspace.WorktreePath) {
+		t.Fatalf("unexpected finish result=%#v exists=%t", result, pathIsDir(workspace.WorktreePath))
+	}
+	if !pathIsFile(filepath.Join(repo, "finish.txt")) || app.Git.RefExists(ctx, repo, workspace.Source.Ref) {
+		t.Fatal("finish must merge and delete its managed branch")
+	}
+	repeated, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "finish", Base: "main"})
+	if err != nil {
+		t.Fatalf("reuse finished name: %v", err)
+	}
+	if repeated.Name != workspace.Name || repeated.Source.Ref == workspace.Source.Ref {
+		t.Fatalf("repeated workspace did not receive a fresh branch: old=%#v new=%#v", workspace, repeated)
+	}
+}
+
+func TestFinishBlockedPreservesWorkspace(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceReview, Name: "ro", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.FinishWorkspace(ctx, workspace.ID, "", repo); ErrorCode(err) != "workspace_detached" {
+		t.Fatalf("expected workspace_detached, got %v", err)
+	}
+	if !pathIsDir(workspace.WorktreePath) {
+		t.Fatal("blocked finish removed the Workspace")
 	}
 }
 
 func TestStatusReportsUnknownAndPropagatesGitErrors(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "status", FromRef: "main", New: true})
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "status", Base: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	status, err := app.Status(ctx, workspace.ID, "", repo)
+	status, err := app.Status(ctx, workspace.ID, repo)
 	if err != nil || status.Dirty == nil || *status.Dirty {
 		t.Fatalf("expected a known clean status, status=%#v err=%v", status, err)
 	}
@@ -527,7 +541,7 @@ func TestStatusReportsUnknownAndPropagatesGitErrors(t *testing.T) {
 	if err := os.Rename(gitFile, disabledGitFile); err != nil {
 		t.Fatal(err)
 	}
-	_, statusErr := app.Status(ctx, workspace.ID, "", repo)
+	_, statusErr := app.Status(ctx, workspace.ID, repo)
 	if err := os.Rename(disabledGitFile, gitFile); err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +550,7 @@ func TestStatusReportsUnknownAndPropagatesGitErrors(t *testing.T) {
 	}
 
 	gitCommand(t, repo, "worktree", "remove", "--force", workspace.WorktreePath)
-	status, err = app.Status(ctx, workspace.ID, "", repo)
+	status, err = app.Status(ctx, workspace.ID, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,29 +561,28 @@ func TestStatusReportsUnknownAndPropagatesGitErrors(t *testing.T) {
 
 func TestGCReportsDirectoryReadErrors(t *testing.T) {
 	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
 	for _, test := range []struct {
 		name string
 		path func(Paths) string
 	}{
 		{name: "tasks", path: Paths.TasksDir},
-		{name: "worktrees", path: Paths.WorktreesDir},
+		{name: "worktrees", path: func(p Paths) string { return p.WorktreesDir }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			paths := Paths{Home: filepath.Join(t.TempDir(), "home")}
-			app, err := NewApp(paths)
-			if err != nil {
+			target := test.path(app.Paths)
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			target := test.path(paths)
-			if err := os.Remove(target); err != nil {
-				t.Fatal(err)
-			}
+			_ = os.RemoveAll(target)
 			if err := os.WriteFile(target, []byte("not a directory"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := app.GC(ctx, true); ErrorCode(err) != "gc_scan_failed" {
 				t.Fatalf("expected gc_scan_failed, got %v", err)
 			}
+			_ = os.Remove(target)
 		})
 	}
 }
@@ -577,11 +590,8 @@ func TestGCReportsDirectoryReadErrors(t *testing.T) {
 func TestApplyFromNonReadyWorkspaceReportsState(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
-	app, _ := NewApp(Paths{Home: filepath.Join(t.TempDir(), "home")})
-	if _, _, err := app.InitProject(ctx, InitRequest{CWD: repo, Name: "Demo", DefaultBranch: "main"}); err != nil {
-		t.Fatal(err)
-	}
-	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Ref: "not-ready", FromRef: "main", New: true})
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "not-ready", Base: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +599,66 @@ func TestApplyFromNonReadyWorkspaceReportsState(t *testing.T) {
 	if err := app.Store.SaveWorkspace(workspace); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.ApplyWorkspace(ctx, "", "", workspace.WorktreePath); ErrorCode(err) != "workspace_not_ready" {
+	_, err = app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath})
+	if ErrorCode(err) != "workspace_not_ready" {
 		t.Fatalf("expected workspace_not_ready, got %v", err)
+	}
+}
+
+func TestWorktreeLayoutIsSiblingDirectory(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "layout", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := filepath.Join(filepath.Dir(repo), "repo-gws", workspace.ID)
+	if !strings.HasSuffix(filepath.Clean(workspace.WorktreePath), strings.TrimPrefix(expected, "/")) {
+		t.Fatalf("worktree path=%q expected suffix=%q", workspace.WorktreePath, expected)
+	}
+	if filepath.Base(filepath.Dir(workspace.WorktreePath)) != "repo-gws" {
+		t.Fatalf("worktree is not in a sibling <repo>-gws directory: %s", workspace.WorktreePath)
+	}
+	stateFiles := []string{app.Paths.ConfigFile(), app.Paths.WorkspaceFile(workspace.ID), app.Paths.TaskFile(workspace.ID), app.Paths.LockFile()}
+	repoCanonical, _ := canonical(repo)
+	for _, file := range stateFiles {
+		if !strings.HasPrefix(file, filepath.Join(repoCanonical, ".git", "gws")) {
+			t.Fatalf("state file escaped .git/gws: %s", file)
+		}
+	}
+	if !pathIsFile(app.Paths.TaskFile(workspace.ID)) {
+		t.Fatal("task file missing")
+	}
+	content, err := os.ReadFile(app.Paths.TaskFile(workspace.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "Base: main") || !strings.Contains(string(content), "Base commit: "+workspace.Source.BaseCommit) {
+		t.Fatalf("task file lacks base info:\n%s", content)
+	}
+}
+
+func TestDetectRepositoryWorksFromWorkspaceCWD(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "shared", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromWorkspace, err := app.Git.DetectRepository(ctx, workspace.WorktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromWorkspace.GitCommonDir != app.Repo.GitCommonDir {
+		t.Fatalf("common dir mismatch: %q vs %q", fromWorkspace.GitCommonDir, app.Repo.GitCommonDir)
+	}
+	other := newTestApp(t, workspace.WorktreePath)
+	if other.Paths.StateDir != app.Paths.StateDir {
+		t.Fatalf("state dir differs when run from the workspace: %q vs %q", other.Paths.StateDir, app.Paths.StateDir)
+	}
+	if _, err := other.ResolveWorkspace(ctx, workspace.ID, workspace.WorktreePath, true); err != nil {
+		t.Fatalf("workspace metadata is not shared: %v", err)
 	}
 }

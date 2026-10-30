@@ -8,13 +8,15 @@
 
 ## 1. Product definition
 
-Git Workspace is an opinionated Git worktree manager. It turns a development work
-item into a named, inspectable, and safely disposable Workspace.
+Git Workspace is an opinionated Git worktree manager. It carves isolated
+Workspaces out of the branch you are on and merges them back safely, so you can
+triage a problem or develop in parallel without disturbing your main checkout.
 
 Its value proposition is:
 
-> A clear work-item model, automatic branch policy, guarded cleanup, and an
-> explicit apply/finish workflow on top of Git worktree.
+> One-step Workspace creation from the current branch, base tracking, guarded
+> cleanup, precondition-checked merge-back, and a versioned machine interface
+> on top of Git worktree.
 
 Git Workspace is both:
 
@@ -28,10 +30,10 @@ Git Workspace is not itself a complete development-environment isolation platfor
 
 Git Workspace owns:
 
-- repository registration and current-project resolution;
-- work-item identity and Workspace metadata;
+- repository-scoped Workspace metadata and resolution;
+- base ref/base commit recording for every Workspace type;
 - Git worktree creation and removal;
-- automatic, collision-free managed branches;
+- automatic, collision-free managed branches in the `gws/` namespace;
 - detached review/test worktrees;
 - task context files;
 - state locking, rollback, status verification, and garbage collection;
@@ -52,238 +54,228 @@ path returned by Git Workspace.
 
 ## 3. Domain model
 
-### 3.1 Project
+### 3.1 Repository scope
 
-A Project registers one canonical Git common directory and its original
-checkout. It contains a stable ID, display name, repository path, Git common
-directory, default branch, configuration path, and timestamps.
-
-Two paths belonging to the same Git common directory are the same Project.
-`init` is idempotent and must not duplicate it.
+There is no registry. The repository containing `cwd` (identified by its Git
+common directory) is the scope of every command. All Workspaces, metadata, and
+locks live under `<git-common-dir>/gws/`, so every linked worktree of the same
+repository shares one state, and unrelated repositories can never see each
+other's Workspaces. Commands outside a Git repository fail with
+`repository_not_found`.
 
 ### 3.2 Work item
 
 A work item is an optional human-readable label for the user's intent, such as
 `feature/avatar` or `issue-328`. Its name is not a Git branch name and must not
-be coupled to branch existence. When omitted by `gws new`, the implementation
-uses `workspace` as the generated label.
+be coupled to branch existence. When omitted, the implementation derives a
+label from the base branch slug, falling back to `workspace`; review and test
+types prefix the label with `review-`/`test-`.
 
-The normalized work-item name is retained in Workspace metadata. Path
-components are preserved by normalization: `feature/avatar` becomes
-`feature-avatar`, not just `avatar`.
+The normalized label is retained in Workspace metadata. Path components are
+preserved by normalization: `feature/avatar` becomes `feature-avatar`, not just
+`avatar`.
 
 ### 3.3 Workspace
 
 A Workspace is a managed record linking:
 
-- one Project;
 - one work item and stable Workspace ID;
 - one Git worktree path;
-- one source ref and optional base/from refs;
+- one source ref plus recorded `base_ref` and `base_commit`;
 - one task file;
 - type, ownership, lifecycle state, error, and timestamps.
 
 Lifecycle states are `creating`, `ready`, `error`, and `removing`.
 
 Workspace types are `dev`, `fix`, `review`, and `test`. Review and test
-Workspaces are detached and cannot be applied.
+Workspaces are detached and cannot be applied. `--detach` produces a detached
+worktree of any type.
+
+Managed branches carry the `gws/` namespace and an ownership flag. Only flagged
+branches are ever deleted automatically, and `gc` never deletes branches.
 
 ## 4. Primary workflow
 
-### 4.1 Register
+### 4.1 Create
 
 ```bash
-gws init [--name NAME] [--default-branch BRANCH]
+gws new [NAME] [--base BRANCH|SHA] [--type dev|fix|review|test] [--detach] [--fetch] [--no-enter] [--json]
 ```
 
-`init` treats `cwd` itself as the Project root. If that exact directory is not
-already a Git repository root, it initializes one there first, including when
-`cwd` is nested inside a parent repository. The configured or explicit default
-branch is used as the initial branch when present. Re-running `init` for the
-same Git common directory returns the same Project ID and updates only mutable
-explicit/configured fields. Project names remain unchanged; new Project IDs
-use the name slug plus a random suffix to avoid collisions and concurrent
-registration conflicts.
+`new` creates a Workspace based on:
 
-Project registration can be inspected or removed with `gws project ls`,
-`gws project show`, and `gws project rm`. Removing a Project removes only its
-registration after verifying that it has no Workspaces.
+1. `--base <branch|sha>` when given; otherwise
+2. the current branch when `cwd` is attached inside this repository; otherwise
+3. `default_branch` from `.git/gws/config.json`; otherwise a
+   `git_ref_not_found` error.
 
-### 4.2 Create
+It records both the base ref and the resolved base commit for every type, so
+inspection output and task files always show the exact baseline
+(`Based on: <base> (<sha>)`).
+
+For `dev`/`fix` it allocates a unique managed branch `gws/<name>` at the base
+commit. For `review`/`test` (or `--detach`) the worktree is detached at the
+resolved base commit. `--fetch` refreshes remote refs first and is rejected for
+`dev`/`fix`.
+
+After creation, `new` enters the user's shell in the worktree unless `--json`,
+`--no-enter`, or non-TTY stdout is used; in those cases it prints
+`Next: gws use <id>` instead. Multiple Workspaces may share a label; their
+IDs, branches, and paths must remain unique, and ambiguous name selectors
+require a Workspace ID.
+
+Creating a Workspace directly on top of an existing user branch is not
+supported: Git forbids attaching two worktrees to one branch, so every
+development Workspace gets its own managed branch.
+
+### 4.2 Enter
 
 ```bash
-gws new [NAME] [--from REF]
+gws use [WORKSPACE]
 ```
 
-`new` creates a dev Workspace from the current branch, unless `--from`
-overrides it. It allocates a unique branch with the `gws/` prefix and
-marks that branch as managed.
+`use` starts the user's shell with the worktree as its working directory. It
+cannot change the parent shell's directory. The state lock must be released
+before the child shell starts. Selectors accept exact ID, exact name, or an
+unambiguous ID prefix; an omitted selector resolves from `cwd`. `use` is
+interactive-only and rejects `--json`.
 
-The Project is always resolved from `cwd`; `new` does not accept `--project`.
-If `cwd` is not itself a repository root or is not registered, `new` initializes
-and registers it automatically. If the repository has no commits, `new` creates
-an empty root commit before creating the worktree. This operation must preserve
-the existing index and must not include staged changes in the generated commit.
-
-No same-named user branch may block `new` because `NAME` is a work-item label.
-Detached `cwd` requires an explicit `--from`.
-
-Multiple Workspaces may share a work-item name. Their IDs, branches, and paths
-must remain unique; ambiguous name selectors require a Workspace ID.
-
-Advanced explicit-ref entry points remain available:
+### 4.3 Inspect
 
 ```text
-gws dev BRANCH [--new] [--from REF]
-gws fix BRANCH [--new] [--from REF]
-gws review BRANCH [--base REF] [--fetch]
-gws test BRANCH [--base REF]
-```
-
-Only `review --fetch` performs an implicit network fetch.
-
-### 4.3 Enter
-
-```bash
-gws checkout [WORKSPACE]
-```
-
-`checkout` starts the user's shell with the worktree as its working directory.
-It cannot change the parent shell's directory. The state lock must be released
-before the child shell starts.
-
-### 4.4 Inspect
-
-```text
-gws ls [--project PROJECT]
+gws ls
 gws show [WORKSPACE]
 gws status [WORKSPACE]
 gws path [WORKSPACE]
+gws diff [WORKSPACE] [--staged] [--stat] [--uncommitted]
+gws log [WORKSPACE] [--limit N] [--stat]
+gws commit --message MESSAGE [--all]
 ```
 
-`show` presents persisted metadata. `status` also verifies the filesystem, Git
-worktree registration, dirty state, and task-file existence. When the worktree is
-missing, JSON reports `git.dirty` as `null`; a failed Git status check is returned as
-an error rather than being reported as clean.
+`diff`, `log`, and `commit` are thin wrappers that resolve the Workspace from
+`cwd` (or an explicit selector) and run Git inside its worktree, so callers never
+repeat the path or look up the base commit:
+
+- `diff` prints `git diff <base_commit>`, i.e. everything the Workspace changed
+  since its base, including committed work. `--uncommitted` switches the
+  comparison to `HEAD`; `--staged` compares the index; `--stat` summarizes.
+  Because Git never reports untracked files in a diff, they are listed
+  separately.
+- `log` prints `git log --oneline <base_commit>..HEAD`, limited by `--limit`.
+- `commit` runs `git commit -m` inside the Workspace, with `--all` mapping to
+  `-a` (tracked files only). It refuses detached review/test Workspaces, stays
+  read-only otherwise, and reports an empty message or a clean worktree as
+  errors instead of prompting.
+
+These commands only read Git state apart from `commit`, which never changes
+Workspace metadata.
+
+`show` presents persisted metadata including base ref and base commit. `status`
+also verifies the filesystem, Git worktree registration, dirty state, and
+task-file existence, and reports the base. When the worktree is missing, JSON
+reports `git.dirty` as `null`; a failed Git status check is returned as an
+error rather than being reported as clean.
 
 Inside a managed worktree, an omitted Workspace selector resolves from `cwd`.
 
-### 4.5 Apply and finish
+### 4.4 Apply and finish
 
 ```text
-gws apply [WORKSPACE]
-gws finish WORKSPACE
+gws apply [--into BRANCH]
+gws finish WORKSPACE [--into BRANCH]
 ```
 
-`apply` merges the clean, committed, attached Workspace branch into the branch
-currently checked out in the registered original checkout. It preserves the
-Workspace.
+`apply` must run from inside the Workspace; the selector is always resolved
+from `cwd` and positional arguments are rejected. Its merge target is the
+recorded base branch, overridden by `--into <branch>`.
 
-Without a Workspace selector, `apply` first selects the Workspace containing
-`cwd`. If `cwd` is not inside a Workspace, it scopes candidates to the Project
-resolved from `cwd` and automatically selects only when exactly one ready,
-attached Workspace exists. Multiple candidates are an ambiguity error whose
-message and structured details include their IDs. Workspaces from other
-Projects must never be selected implicitly.
+`finish` runs from the main checkout (outside the Workspace), applies with the
+same target rules, and starts cleanup only after merge success. It removes the
+worktree, task metadata, and the managed branch when ownership is recorded.
 
-`finish` performs the same apply operation and starts cleanup only after merge
-success. It removes the worktree and task metadata, and deletes the source
-branch only when metadata marks it as Git Workspace-managed.
+Both commands validate all preconditions before touching anything and stop
+with a structured blocking reason (`apply_blocked` family):
 
-Both commands reject:
+- not inside a Workspace (apply) / inside the Workspace (finish);
+- Workspace state is not `ready`;
+- detached review/test Workspace;
+- Workspace worktree dirty, missing, or unregistered;
+- no target: base is a pure SHA and no `--into` was given;
+- source equals target;
+- main checkout detached, or not on the target branch (never auto-switched);
+- main checkout dirty;
+- merge conflict — the conflict is left in the main checkout for normal Git
+  resolution or `git merge --abort`, and the Workspace is preserved.
 
-- dirty Workspace worktrees;
-- detached review/test Workspaces;
-- a dirty or detached original checkout;
-- execution of `finish` from inside the Workspace being removed.
+Blocking errors include `workspace_id` and `source_branch` details and an
+actionable message naming the exact Git command or `--into` alternative.
 
-A merge conflict remains in the original checkout for normal Git conflict
-resolution or `git merge --abort`; the Workspace is preserved.
-
-### 4.6 Remove and recover
+### 4.5 Remove and recover
 
 ```text
-gws rm WORKSPACE [--project PROJECT] [--force]
+gws rm WORKSPACE [--force]
 gws gc [--dry-run]
-gws doctor [--project PROJECT]
+gws doctor
 ```
 
-Normal removal refuses a dirty worktree. `--force` skips only the dirty check.
-It never skips canonical-path and ownership validation.
-
-Without `--project`, `rm` resolves the Project from `cwd` first and searches
-only that Project's Workspaces. An explicit `--project` is required to remove a
-Workspace belonging to another registered repository.
+Normal removal refuses a dirty worktree and deletes the managed branch when
+present. `--force` skips only the dirty check. It never skips canonical-path
+and ownership validation.
 
 Garbage collection acts only on resources whose Git Workspace ownership can be
-proven. Unknown resources are reported and preserved. `--dry-run` is the
-recommended first step.
+proven. Unknown resources are reported and preserved; branches are never
+deleted by `gc`. `--dry-run` is the recommended first step.
+
+`doctor` self-checks the current repository: Git availability, config file,
+state directory, and Workspace/worktree consistency.
 
 ## 5. Resolution rules
 
-Project resolution order:
-
-1. explicit `--project` selector;
-2. Workspace containing `cwd`;
-3. registered Project with the same Git common directory as `cwd`;
-4. otherwise return a resolution error suggesting `gws init` or
-   `--project`.
-
-Git Workspace must not select a Project merely because only one is registered.
-
-`new` is intentionally stricter than the general rule: it always uses `cwd` and
-rejects `--project`. `rm` uses `cwd` by default and permits `--project` only as
-an explicit cross-repository operation.
+Repository resolution: `git rev-parse --show-toplevel` plus
+`--git-common-dir` from `cwd`. No selector, no registry, no cross-repository
+implicit search.
 
 Workspace resolution accepts exact ID, exact name, and—where explicitly
-enabled—an unambiguous ID prefix. Ambiguity is an error.
+enabled—an unambiguous ID prefix. Ambiguity is an error whose structured
+details include the candidate Workspaces.
 
 ## 6. State and configuration
 
-Default state root:
+All state lives inside the repository:
 
 ```text
-~/.git-workspace/
-├── projects/
-├── workspaces/
-├── worktrees/
-├── tasks/
+<repo>/.git/gws/
+├── config.json          optional, {"version":1,"default_branch":"main"}
+├── workspaces/<id>.json
+├── tasks/<id>.md
 └── locks/state.lock
+
+<parent>/<repo>-gws/<id>/    worktree checkout (sibling directory)
 ```
 
-`GIT_WORKSPACE_HOME` overrides the root.
+Because metadata hangs off the Git common directory, all linked worktrees share
+one state; cloning the repository carries nothing over. `config.json` is
+optional and never created automatically; its only field is the fallback
+`default_branch` used when HEAD is detached and no `--base` is given.
 
-Repository configuration is optional and read from the registered original
-checkout:
-
-```yaml
-version: 1
-
-project:
-  name: example
-  default_branch: main
-```
-
-No agent, editor, or runtime section is accepted. Project fields are imported
-by `init`; commands do not continuously mutate registration from config.
-
-Persisted Project and Workspace records carry `state_version: 1`. Unversioned
-legacy records are interpreted as version 1. A record with a newer unsupported
-version is rejected with `state_version_unsupported` and must not be overwritten.
+Persisted Workspace records carry `state_version: 1`. Unversioned legacy
+records are interpreted as version 1. A record with a newer unsupported version
+is rejected with `state_version_unsupported` and must not be overwritten.
 
 All state files use atomic same-directory replacement. Mutations hold the
-global exclusive advisory lock; reads hold a shared lock. Lock acquisition is
-bounded and cancellation-aware.
+repository-wide exclusive advisory lock; reads hold a shared lock. Lock
+acquisition is bounded and cancellation-aware.
 
 ## 7. Safety invariants
 
 Git Workspace must never:
 
-- recursively delete the user home, repository root, state root, or worktree
-  root;
+- recursively delete the user home, repository root, repository parent, state
+  root, or worktree root;
 - remove a directory outside the canonical configured worktree root;
 - remove a path whose Workspace ownership cannot be proven;
 - delete an unowned user branch;
+- auto-switch the main checkout's branch during apply/finish;
 - hide a failed apply behind successful cleanup;
 - trust persisted state without checking real Git/filesystem state where a
   destructive action depends on it.
@@ -302,8 +294,9 @@ of platform language and runtime.
 gws capabilities --json
 ```
 
-The response declares `protocol_version: 1`, backend `git-worktree`, features,
-and interactive-only commands.
+The response declares `protocol_version: 2`, backend `git-worktree`, features,
+and interactive-only commands (`use`, and `new` without `--json`/`--no-enter`).
+`capabilities` runs outside a repository.
 
 ### 8.2 JSON envelope
 
@@ -315,7 +308,7 @@ Every non-interactive lifecycle and inspection command accepts `--json`:
   "command": "path",
   "data": {
     "workspace_id": "avatar-8a10",
-    "path": "/home/user/.git-workspace/worktrees/example/avatar-8a10"
+    "path": "/home/user/projects/example-gws/avatar-8a10"
   },
   "error": null
 }
@@ -323,12 +316,14 @@ Every non-interactive lifecycle and inspection command accepts `--json`:
 
 Failures write one JSON envelope to stdout, write nothing to stderr, and exit
 non-zero. `data` is null and `error` contains stable `code`, `message`, and
-`details` fields.
+`details` fields. Workspace objects expose `source.base_ref`,
+`source.base_commit`, `detached`, `managed`, and `from_ref`.
 
 Human-readable output is not a plugin API and may evolve.
 
-`checkout` is interactive and rejects `--json`. Platforms call `path --json`
-and launch their own process/container/agent in the returned directory.
+`use` is interactive and rejects `--json`. Platforms call `path --json` and
+launch their own process/container/agent in the returned directory. `new
+--json` creates without entering a shell.
 
 ### 8.3 Ownership split
 
@@ -350,10 +345,12 @@ requests `finish`, `rm`, or destructive GC.
 
 - All help, prompts, task files, branches, config defaults, binary paths, and
   documentation use Git Workspace naming.
+- Every Workspace records and displays its base ref and base commit.
 - `new` is independent of same-named user branches.
-- `apply` preserves the Workspace; `finish` cleans up only after success.
+- `apply` preserves the Workspace; `finish` cleans up only after success;
+  neither auto-switches the main checkout.
 - Dirty and unowned paths are protected from deletion.
-- Human inspection output and JSON Schema v2 expose Project, Workspace, branch,
-  base/from, state, worktree, and task data.
-- `capabilities --json` exposes plugin protocol version 1.
+- Human inspection output and JSON Schema v2 expose Workspace, branch, base,
+  state, worktree, and task data.
+- `capabilities --json` exposes plugin protocol version 2.
 - Unit, integration, race, vet, and build checks pass.

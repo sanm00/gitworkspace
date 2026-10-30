@@ -8,11 +8,11 @@ import (
 	"testing"
 )
 
-func TestLaunchCheckoutShellUsesWorkspaceCWDAndShellArguments(t *testing.T) {
+func TestLaunchShellUsesWorkspaceCWDAndShellArguments(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SHELL", "/bin/sh -c pwd")
 	var stdout, stderr bytes.Buffer
-	if err := (&App{}).LaunchCheckoutShell(context.Background(), Workspace{WorktreePath: dir}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
+	if err := (&App{}).LaunchShell(context.Background(), Workspace{WorktreePath: dir}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	canonicalDir, err := filepath.EvalSymlinks(dir)

@@ -54,7 +54,7 @@ func (Runner) RunInteractive(ctx context.Context, command Command) error {
 	return cmd.Run()
 }
 
-func (a *App) LaunchCheckoutShell(ctx context.Context, workspace Workspace, stdin io.Reader, stdout, stderr io.Writer) error {
+func (a *App) LaunchShell(ctx context.Context, workspace Workspace, stdin io.Reader, stdout, stderr io.Writer) error {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "/bin/sh"
@@ -68,7 +68,7 @@ func (a *App) LaunchCheckoutShell(ctx context.Context, workspace Workspace, stdi
 		return NewError("shell_unavailable", fmt.Sprintf("Shell %q is not available.", shellPath))
 	}
 	if err := (Runner{}).RunInteractive(ctx, Command{Path: shellPath, Args: shellArgs, Dir: workspace.WorktreePath, Stdin: stdin, Stdout: stdout, Stderr: stderr}); err != nil {
-		return WrapError("external_command_failed", "Workspace checkout shell failed.", err)
+		return WrapError("external_command_failed", "Workspace shell failed.", err)
 	}
 	return nil
 }

@@ -4,18 +4,6 @@ import "time"
 
 const CurrentStateVersion = 1
 
-type Project struct {
-	StateVersion  int       `json:"state_version"`
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	RepoPath      string    `json:"repo_path"`
-	GitCommonDir  string    `json:"git_common_dir"`
-	DefaultBranch string    `json:"default_branch"`
-	ConfigPath    string    `json:"config_path"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-}
-
 type WorkspaceType string
 
 const (
@@ -35,19 +23,19 @@ const (
 )
 
 type SourceSpec struct {
-	Kind     string `json:"kind"`
-	Ref      string `json:"ref"`
-	BaseRef  string `json:"base_ref,omitempty"`
-	Detached bool   `json:"detached"`
-	New      bool   `json:"new,omitempty"`
-	Managed  bool   `json:"managed,omitempty"`
-	FromRef  string `json:"from_ref,omitempty"`
+	Kind       string `json:"kind"`
+	Ref        string `json:"ref"`
+	BaseRef    string `json:"base_ref,omitempty"`
+	BaseCommit string `json:"base_commit,omitempty"`
+	Detached   bool   `json:"detached"`
+	New        bool   `json:"new,omitempty"`
+	Managed    bool   `json:"managed,omitempty"`
+	FromRef    string `json:"from_ref,omitempty"`
 }
 
 type Workspace struct {
 	StateVersion int            `json:"state_version"`
 	ID           string         `json:"id"`
-	ProjectID    string         `json:"project_id"`
 	Name         string         `json:"name"`
 	Type         WorkspaceType  `json:"type"`
 	Source       SourceSpec     `json:"source"`
@@ -59,12 +47,6 @@ type Workspace struct {
 	UpdatedAt    time.Time      `json:"updated_at"`
 }
 
-type ProjectConfig struct {
-	Version       int
-	Name          string
-	DefaultBranch string
-}
-
 type Repository struct {
 	Root          string
 	GitCommonDir  string
@@ -73,7 +55,7 @@ type Repository struct {
 
 type Status struct {
 	Workspace          Workspace
-	RepoExists         bool
+	RepoRoot           string
 	WorktreeExists     bool
 	WorktreeRegistered bool
 	Dirty              *bool
@@ -82,9 +64,28 @@ type Status struct {
 
 type ApplyResult struct {
 	Workspace    Workspace
-	Project      Project
+	RepoRoot     string
 	SourceBranch string
 	TargetBranch string
+}
+
+type DiffResult struct {
+	Workspace Workspace
+	Base      string
+	Content   string
+	Untracked []string
+}
+
+type LogResult struct {
+	Workspace Workspace
+	Base      string
+	Content   string
+}
+
+type CommitResult struct {
+	Workspace Workspace
+	Commit    string
+	Subject   string
 }
 
 type GCAction struct {

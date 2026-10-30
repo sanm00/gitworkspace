@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -19,299 +20,101 @@ type App struct {
 	Store  Store
 	Git    Git
 	Locker StateLocker
+	Repo   Repository
 	Now    func() time.Time
 }
 
-func NewApp(paths Paths) (*App, error) {
-	if err := paths.Ensure(); err != nil {
-		return nil, err
+func NewApp(paths Paths, repo Repository) *App {
+	return &App{
+		Paths:  paths,
+		Store:  Store{Paths: paths},
+		Git:    Git{Runner: Runner{}},
+		Locker: StateLocker{Path: paths.LockFile(), Timeout: 10 * time.Second},
+		Repo:   repo,
+		Now:    func() time.Time { return time.Now().UTC() },
 	}
-	return &App{Paths: paths, Store: Store{Paths: paths}, Git: Git{Runner: Runner{}}, Locker: StateLocker{Path: paths.LockFile(), Timeout: 10 * time.Second}, Now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
-type InitRequest struct{ CWD, Name, DefaultBranch string }
-
-func (a *App) InitProject(ctx context.Context, request InitRequest) (project Project, updated bool, err error) {
-	err = a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
-		repo, detectErr := a.Git.DetectRepository(ctx, request.CWD)
-		cwd, canonicalErr := canonical(request.CWD)
-		if canonicalErr != nil {
-			return canonicalErr
-		}
-		initializeRepository := detectErr != nil || repo.Root != cwd
-		if initializeRepository {
-			config, configErr := LoadProjectConfig(filepath.Join(request.CWD, ".git-workspace.yaml"))
-			if configErr != nil {
-				return configErr
-			}
-			initialBranch := firstNonEmpty(request.DefaultBranch, config.DefaultBranch)
-			if initErr := a.Git.InitRepository(ctx, request.CWD, initialBranch); initErr != nil {
-				return initErr
-			}
-			repo, detectErr = a.Git.DetectRepository(ctx, request.CWD)
-			if detectErr != nil {
-				return detectErr
-			}
-		}
-		projects, listErr := a.Store.Projects()
-		if listErr != nil {
-			return listErr
-		}
-		for _, candidate := range projects {
-			if candidate.GitCommonDir != repo.GitCommonDir {
-				continue
-			}
-			project = candidate
-			configPath := filepath.Join(project.RepoPath, ".git-workspace.yaml")
-			config, configErr := LoadProjectConfig(configPath)
-			if configErr != nil {
-				return configErr
-			}
-			name := firstNonEmpty(request.Name, config.Name, project.Name)
-			branch := firstNonEmpty(request.DefaultBranch, config.DefaultBranch, project.DefaultBranch)
-			if err := validateProjectName(projects, project.ID, name); err != nil {
-				return err
-			}
-			if name != project.Name || branch != project.DefaultBranch || project.ConfigPath != configPath {
-				project.Name, project.DefaultBranch, project.ConfigPath, project.UpdatedAt = name, branch, configPath, a.Now()
-				if err := a.Store.SaveProject(project); err != nil {
-					return err
-				}
-				updated = true
-			}
-			return nil
-		}
-		configPath := filepath.Join(repo.Root, ".git-workspace.yaml")
-		config, configErr := LoadProjectConfig(configPath)
-		if configErr != nil {
-			return configErr
-		}
-		name := firstNonEmpty(request.Name, config.Name, filepath.Base(repo.Root))
-		branch := firstNonEmpty(request.DefaultBranch, config.DefaultBranch, repo.CurrentBranch)
-		if branch == "" {
-			return NewError("config_invalid", "Could not detect a default branch. Use --default-branch.")
-		}
-		if err := validateProjectName(projects, "", name); err != nil {
-			return err
-		}
-		id, idErr := uniqueProjectID(projects, slug(name))
-		if idErr != nil {
-			return idErr
-		}
-		now := a.Now()
-		project = Project{StateVersion: CurrentStateVersion, ID: id, Name: name, RepoPath: repo.Root, GitCommonDir: repo.GitCommonDir, DefaultBranch: branch, ConfigPath: configPath, CreatedAt: now, UpdatedAt: now}
-		if err := a.Store.SaveProject(project); err != nil {
-			return err
-		}
-		updated = true
-		return nil
-	})
-	return
-}
-
-func validateProjectName(projects []Project, excludeID, name string) error {
-	if strings.TrimSpace(name) == "" {
-		return NewError("config_invalid", "Project name cannot be empty.")
-	}
-	for _, p := range projects {
-		if p.ID != excludeID && strings.EqualFold(p.Name, name) {
-			return NewError("project_ambiguous", fmt.Sprintf("Project name %q is already registered.", name))
-		}
-	}
-	return nil
-}
-
-func (a *App) Projects(ctx context.Context) (values []Project, err error) {
-	err = a.Locker.WithShared(ctx, func(context.Context) error { var e error; values, e = a.Store.Projects(); return e })
-	return
-}
-
-func (a *App) ResolveProject(ctx context.Context, selector, cwd string) (project Project, err error) {
-	err = a.Locker.WithShared(ctx, func(ctx context.Context) error {
-		var e error
-		project, e = a.resolveProjectUnlocked(ctx, selector, cwd)
-		return e
-	})
-	return
-}
-
-func (a *App) EnsureInitialCommit(ctx context.Context, cwd string) (created bool, err error) {
-	err = a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
-		project, resolveErr := a.resolveProjectUnlocked(ctx, "", cwd)
-		if resolveErr != nil {
-			return resolveErr
-		}
-		if a.Git.HasCommits(ctx, project.RepoPath) {
-			return nil
-		}
-		if createErr := a.Git.CreateEmptyInitialCommit(ctx, project.RepoPath); createErr != nil {
-			return createErr
-		}
-		created = true
-		return nil
-	})
-	return
-}
-
-func (a *App) resolveProjectUnlocked(ctx context.Context, selector, cwd string) (Project, error) {
-	projects, err := a.Store.Projects()
-	if err != nil {
-		return Project{}, err
-	}
-	if selector != "" {
-		return selectProject(projects, selector, true)
-	}
-	canonicalCWD, err := canonical(cwd)
-	if err == nil {
-		workspaces, _ := a.Store.Workspaces()
-		best := ""
-		projectID := ""
-		for _, w := range workspaces {
-			worktreePath, pathErr := canonical(w.WorktreePath)
-			if pathErr == nil && isWithin(canonicalCWD, worktreePath, false) && len(worktreePath) > len(best) {
-				best, projectID = worktreePath, w.ProjectID
-			}
-		}
-		if projectID != "" {
-			for _, p := range projects {
-				if p.ID == projectID {
-					return p, nil
-				}
-			}
-		}
-	}
-	repo, detectErr := a.Git.DetectRepository(ctx, cwd)
-	if detectErr == nil {
-		for _, p := range projects {
-			if p.GitCommonDir == repo.GitCommonDir {
-				return p, nil
-			}
-		}
-	}
-	return Project{}, NewError("project_not_found", "Could not resolve a registered Project. Enter a registered repository, run gws init, or use --project.")
-}
-
-func selectProject(projects []Project, selector string, allowPrefix bool) (Project, error) {
-	canonicalSelector, _ := canonical(selector)
-	matches := []Project{}
-	for _, p := range projects {
-		if p.ID == selector || strings.EqualFold(p.Name, selector) || (canonicalSelector != "" && p.RepoPath == canonicalSelector) {
-			matches = append(matches, p)
-		}
-	}
-	if len(matches) == 0 && allowPrefix && selector != "" {
-		for _, p := range projects {
-			if strings.HasPrefix(p.ID, selector) {
-				matches = append(matches, p)
-			}
-		}
-	}
-	if len(matches) == 1 {
-		return matches[0], nil
-	}
-	if len(matches) == 0 {
-		return Project{}, NewError("project_not_found", fmt.Sprintf("Project %q was not found.", selector))
-	}
-	err := NewError("project_ambiguous", fmt.Sprintf("Project %q is ambiguous.", selector))
-	err.Details["candidates"] = matches
-	return Project{}, err
-}
-
-func (a *App) RemoveProject(ctx context.Context, selector string) error {
-	return a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
-		projects, err := a.Store.Projects()
-		if err != nil {
-			return err
-		}
-		project, err := selectProject(projects, selector, false)
-		if err != nil {
-			return err
-		}
-		workspaces, err := a.Store.Workspaces()
-		if err != nil {
-			return err
-		}
-		for _, w := range workspaces {
-			if w.ProjectID == project.ID {
-				return NewError("project_has_workspaces", fmt.Sprintf("Project %s still has registered Workspaces.", project.Name))
-			}
-		}
-		return a.Store.DeleteProject(project.ID)
-	})
-}
+func (a *App) Config() (ProjectConfig, error) { return LoadConfig(a.Paths.ConfigFile()) }
 
 type CreateRequest struct {
-	ProjectSelector, CWD, Name, Ref, BaseRef, FromRef string
-	Type                                              WorkspaceType
-	New, Fetch, FromCurrent, GenerateBranch           bool
+	CWD    string
+	Name   string
+	Base   string
+	Type   WorkspaceType
+	Detach bool
+	Fetch  bool
 }
+
+var shaPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,40}$`)
 
 func (a *App) CreateWorkspace(ctx context.Context, request CreateRequest) (workspace Workspace, err error) {
 	err = a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
-		project, resolveErr := a.resolveProjectUnlocked(ctx, request.ProjectSelector, request.CWD)
-		if resolveErr != nil {
-			return resolveErr
-		}
-		if request.Ref == "" {
-			return NewError("git_ref_not_found", "A source branch is required.")
+		repoPath := a.Repo.Root
+		if !a.Git.HasCommits(ctx, repoPath) {
+			return NewError("git_ref_not_found", "This repository has no commits. Create an initial commit (for example: git commit --allow-empty -m \"Initial commit\"), then retry.")
 		}
 		if request.Fetch {
-			if request.Type != WorkspaceReview {
-				return NewError("config_invalid", "--fetch is supported only by gws review.")
+			if request.Type != WorkspaceReview && request.Type != WorkspaceTest {
+				return NewError("config_invalid", "--fetch is supported only with --type review or --type test.")
 			}
-			if err := a.Git.Fetch(ctx, project.RepoPath); err != nil {
+			if err := a.Git.Fetch(ctx, repoPath); err != nil {
 				return err
 			}
 		}
-		resolvedRef := request.Ref
-		if request.Fetch && !request.New && !a.Git.RefExists(ctx, project.RepoPath, resolvedRef) {
-			remoteRef := "origin/" + strings.TrimPrefix(resolvedRef, "origin/")
-			if a.Git.RefExists(ctx, project.RepoPath, remoteRef) {
-				resolvedRef = remoteRef
-			}
-		}
-		if !request.New && !a.Git.RefExists(ctx, project.RepoPath, resolvedRef) {
-			return NewError("git_ref_not_found", fmt.Sprintf("Git ref %q does not exist locally. For review, retry with --fetch.", request.Ref))
-		}
-		from := request.FromRef
-		if request.New {
-			if !request.GenerateBranch && a.Git.RefExists(ctx, project.RepoPath, resolvedRef) {
-				return NewError("git_ref_exists", fmt.Sprintf("Git branch %q already exists. Choose another name or create a Workspace for the existing branch.", request.Ref))
-			}
-			if from == "" {
-				if request.FromCurrent {
-					repo, detectErr := a.Git.DetectRepository(ctx, request.CWD)
-					if detectErr != nil {
-						return NewError("git_ref_not_found", "Could not detect the current branch. Run this command inside the registered repository or use --from.")
+		baseRef := request.Base
+		detached := request.Type == WorkspaceReview || request.Type == WorkspaceTest || request.Detach
+		if baseRef == "" {
+			repo, detectErr := a.Git.DetectRepository(ctx, request.CWD)
+			if detectErr == nil && repo.GitCommonDir == a.Repo.GitCommonDir && repo.CurrentBranch != "" {
+				baseRef = repo.CurrentBranch
+			} else {
+				config, configErr := a.Config()
+				if configErr != nil {
+					return configErr
+				}
+				baseRef = config.DefaultBranch
+				if baseRef == "" {
+					if detectErr != nil || repo.CurrentBranch == "" {
+						return NewError("git_ref_not_found", "HEAD is detached and no default branch is configured. Pass --base <branch|sha>, or set default_branch in "+a.Paths.ConfigFile()+".")
 					}
-					if repo.GitCommonDir != project.GitCommonDir {
-						return NewError("project_not_found", "The current branch belongs to a different Git repository than the selected Project. Use --from explicitly.")
-					}
-					from = repo.CurrentBranch
-					if from == "" {
-						return NewError("git_ref_not_found", "HEAD is detached, so there is no current branch. Use --from <ref>.")
-					}
-				} else {
-					from = project.DefaultBranch
+					return NewError("git_ref_not_found", "Could not detect a base branch. Pass --base <branch|sha>.")
 				}
 			}
-			if !a.Git.RefExists(ctx, project.RepoPath, from) {
-				if !a.Git.HasCommits(ctx, project.RepoPath) {
-					return NewError("git_ref_not_found", fmt.Sprintf("Start ref %q does not exist because this repository has no commits. Create an initial commit (for example: git commit --allow-empty -m \"Initial commit\"), then retry.", from))
-				}
-				return NewError("git_ref_not_found", fmt.Sprintf("Start ref %q does not exist locally. Choose an existing ref with --from <ref>, or fetch the ref from a remote first.", from))
-			}
 		}
-		base := request.BaseRef
-		if (request.Type == WorkspaceReview || request.Type == WorkspaceTest) && base == "" {
-			base = project.DefaultBranch
+		resolved := baseRef
+		isBranch := a.Git.IsBranch(ctx, repoPath, resolved)
+		if request.Type == WorkspaceReview || request.Type == WorkspaceTest {
+			candidate := baseRef
+			if !strings.HasPrefix(candidate, "origin/") && a.Git.RefExists(ctx, repoPath, candidate) {
+				remoteRef := "origin/" + candidate
+				if a.Git.RefExists(ctx, repoPath, remoteRef) {
+					candidate = remoteRef
+				}
+			}
+			if !a.Git.RefExists(ctx, repoPath, candidate) {
+				return NewError("git_ref_not_found", fmt.Sprintf("Git ref %q does not exist locally. Retry with --fetch to obtain it from a remote.", baseRef))
+			}
+			resolved = candidate
+		} else if !a.Git.RefExists(ctx, repoPath, resolved) {
+			return NewError("git_ref_not_found", fmt.Sprintf("Git ref %q does not exist locally. Retry with --fetch, or choose an existing ref with --base.", baseRef))
+		}
+		baseCommit, err := a.Git.ResolveCommit(ctx, repoPath, resolved)
+		if err != nil {
+			return err
 		}
 		name := request.Name
 		if name == "" {
-			if request.GenerateBranch {
-				name = request.Ref
-			} else {
-				name = defaultWorkspaceName(request.Type, request.Ref)
+			if isBranch {
+				name = slug(strings.TrimPrefix(resolved, "origin/"))
+			}
+			if name == "" {
+				name = "workspace"
+			}
+			if request.Type == WorkspaceReview {
+				name = "review-" + name
+			} else if request.Type == WorkspaceTest {
+				name = "test-" + name
 			}
 		}
 		name = slug(name)
@@ -326,14 +129,23 @@ func (a *App) CreateWorkspace(ctx context.Context, request CreateRequest) (works
 		if idErr != nil {
 			return idErr
 		}
-		if request.GenerateBranch {
-			resolvedRef, idErr = a.uniqueManagedBranch(ctx, project.RepoPath, id)
+		source := SourceSpec{Kind: "branch", Ref: resolved, BaseRef: baseRef, BaseCommit: baseCommit, Detached: detached}
+		branch := ""
+		if !detached {
+			source.New = true
+			source.Managed = true
+			source.FromRef = resolved
+			branch, idErr = a.uniqueManagedBranch(ctx, repoPath, id)
 			if idErr != nil {
 				return idErr
 			}
+			source.Ref = branch
 		}
 		now := a.Now()
-		workspace = Workspace{StateVersion: CurrentStateVersion, ID: id, ProjectID: project.ID, Name: name, Type: request.Type, Source: SourceSpec{Kind: "branch", Ref: resolvedRef, BaseRef: base, Detached: request.Type == WorkspaceReview || request.Type == WorkspaceTest, New: request.New, Managed: request.GenerateBranch, FromRef: from}, WorktreePath: a.Paths.WorktreePath(project.ID, id), TaskFilePath: a.Paths.TaskFile(id), State: StateCreating, CreatedAt: now, UpdatedAt: now}
+		if request.Type == "" {
+			request.Type = WorkspaceDev
+		}
+		workspace = Workspace{StateVersion: CurrentStateVersion, ID: id, Name: name, Type: request.Type, Source: source, WorktreePath: a.Paths.WorktreePath(id), TaskFilePath: a.Paths.TaskFile(id), State: StateCreating, CreatedAt: now, UpdatedAt: now}
 		if err := a.Store.SaveWorkspace(workspace); err != nil {
 			return err
 		}
@@ -346,14 +158,14 @@ func (a *App) CreateWorkspace(ctx context.Context, request CreateRequest) (works
 				}
 			}
 			if worktreeCreated {
-				if removeErr := a.Git.RemoveWorktree(ctx, project.RepoPath, workspace.WorktreePath, true); removeErr != nil {
+				if removeErr := a.Git.RemoveWorktree(ctx, repoPath, workspace.WorktreePath, true); removeErr != nil {
 					rollbackErr = removeErr
 				} else {
-					_ = a.Git.Prune(ctx, project.RepoPath)
+					_ = a.Git.Prune(ctx, repoPath)
 				}
 			}
-			if workspace.Source.Managed && a.Git.RefExists(ctx, project.RepoPath, workspace.Source.Ref) {
-				if branchErr := a.Git.DeleteBranch(ctx, project.RepoPath, workspace.Source.Ref, true); branchErr != nil && rollbackErr == nil {
+			if workspace.Source.Managed && a.Git.RefExists(ctx, repoPath, workspace.Source.Ref) {
+				if branchErr := a.Git.DeleteBranch(ctx, repoPath, workspace.Source.Ref, true); branchErr != nil && rollbackErr == nil {
 					rollbackErr = branchErr
 				}
 			}
@@ -368,11 +180,11 @@ func (a *App) CreateWorkspace(ctx context.Context, request CreateRequest) (works
 		if err := os.MkdirAll(filepath.Dir(workspace.WorktreePath), 0o700); err != nil {
 			return rollback(err)
 		}
-		if err := a.Git.AddWorktree(ctx, project.RepoPath, workspace.WorktreePath, workspace.Source); err != nil {
+		if err := a.Git.AddWorktree(ctx, repoPath, workspace.WorktreePath, workspace.Source); err != nil {
 			return rollback(err)
 		}
 		worktreeCreated = true
-		if err := WriteTask(workspace.TaskFilePath, RenderTask(project, workspace)); err != nil {
+		if err := WriteTask(workspace.TaskFilePath, RenderTask(workspace)); err != nil {
 			return rollback(err)
 		}
 		taskCreated = true
@@ -402,62 +214,27 @@ func (a *App) uniqueManagedBranch(ctx context.Context, repoPath, workspaceID str
 	return "", errors.New("could not allocate unique managed Git branch")
 }
 
-func (a *App) Workspaces(ctx context.Context, projectSelector string) (values []Workspace, err error) {
-	err = a.Locker.WithShared(ctx, func(ctx context.Context) error {
-		var e error
-		values, e = a.Store.Workspaces()
-		if e != nil {
-			return e
-		}
-		if projectSelector != "" {
-			p, resolveErr := a.resolveProjectUnlocked(ctx, projectSelector, "")
-			if resolveErr != nil {
-				return resolveErr
-			}
-			filtered := []Workspace{}
-			for _, w := range values {
-				if w.ProjectID == p.ID {
-					filtered = append(filtered, w)
-				}
-			}
-			values = filtered
-		}
-		return nil
-	})
+func (a *App) Workspaces(ctx context.Context) (values []Workspace, err error) {
+	err = a.Locker.WithShared(ctx, func(context.Context) error { var e error; values, e = a.Store.Workspaces(); return e })
 	return
 }
 
-func (a *App) ResolveWorkspace(ctx context.Context, selector, projectSelector, cwd string, allowPrefix bool) (workspace Workspace, project Project, err error) {
+func (a *App) ResolveWorkspace(ctx context.Context, selector, cwd string, allowPrefix bool) (workspace Workspace, err error) {
 	err = a.Locker.WithShared(ctx, func(ctx context.Context) error {
 		var e error
-		workspace, project, e = a.resolveWorkspaceUnlocked(ctx, selector, projectSelector, cwd, allowPrefix)
+		workspace, e = a.resolveWorkspaceUnlocked(ctx, selector, cwd, allowPrefix)
 		return e
 	})
 	return
 }
 
-func (a *App) resolveWorkspaceUnlocked(ctx context.Context, selector, projectSelector, cwd string, allowPrefix bool) (Workspace, Project, error) {
+func (a *App) resolveWorkspaceUnlocked(ctx context.Context, selector, cwd string, allowPrefix bool) (Workspace, error) {
 	workspaces, err := a.Store.Workspaces()
 	if err != nil {
-		return Workspace{}, Project{}, err
-	}
-	projects, err := a.Store.Projects()
-	if err != nil {
-		return Workspace{}, Project{}, err
-	}
-	projectID := ""
-	if projectSelector != "" {
-		p, e := selectProject(projects, projectSelector, true)
-		if e != nil {
-			return Workspace{}, Project{}, e
-		}
-		projectID = p.ID
+		return Workspace{}, err
 	}
 	matches := []Workspace{}
 	for _, w := range workspaces {
-		if projectID != "" && w.ProjectID != projectID {
-			continue
-		}
 		if w.ID == selector {
 			matches = []Workspace{w}
 			break
@@ -468,7 +245,7 @@ func (a *App) resolveWorkspaceUnlocked(ctx context.Context, selector, projectSel
 	}
 	if len(matches) == 0 && allowPrefix && selector != "" {
 		for _, w := range workspaces {
-			if (projectID == "" || w.ProjectID == projectID) && strings.HasPrefix(w.ID, selector) {
+			if strings.HasPrefix(w.ID, selector) {
 				matches = append(matches, w)
 			}
 		}
@@ -484,9 +261,9 @@ func (a *App) resolveWorkspaceUnlocked(ctx context.Context, selector, projectSel
 	}
 	if len(matches) == 0 {
 		if selector == "" {
-			return Workspace{}, Project{}, NewError("workspace_not_found", "Missing a Workspace argument: the current directory is not inside a registered Workspace. Pass <workspace-id>; run gws ls to list candidates.")
+			return Workspace{}, NewError("workspace_not_found", "Missing a Workspace argument: the current directory is not inside a registered Workspace. Pass <workspace-id>; run gws ls to list candidates.")
 		}
-		return Workspace{}, Project{}, NewError("workspace_not_found", fmt.Sprintf("Workspace %q was not found. Run gws ls to list available Workspace IDs.", selector))
+		return Workspace{}, NewError("workspace_not_found", fmt.Sprintf("Workspace %q was not found. Run gws ls to list available Workspace IDs.", selector))
 	}
 	if len(matches) > 1 {
 		message := fmt.Sprintf("Workspace %q is ambiguous. Run gws ls and pass a Workspace ID.", selector)
@@ -495,96 +272,9 @@ func (a *App) resolveWorkspaceUnlocked(ctx context.Context, selector, projectSel
 		}
 		appErr := NewError("workspace_ambiguous", message)
 		appErr.Details["candidates"] = matches
-		return Workspace{}, Project{}, appErr
+		return Workspace{}, appErr
 	}
-	for _, p := range projects {
-		if p.ID == matches[0].ProjectID {
-			return matches[0], p, nil
-		}
-	}
-	return Workspace{}, Project{}, NewError("project_not_found", "Workspace references a missing Project.")
-}
-
-func (a *App) resolveApplyWorkspaceUnlocked(ctx context.Context, selector, projectSelector, cwd string) (Workspace, Project, error) {
-	if selector != "" {
-		return a.resolveWorkspaceUnlocked(ctx, selector, projectSelector, cwd, true)
-	}
-	workspaces, err := a.Store.Workspaces()
-	if err != nil {
-		return Workspace{}, Project{}, err
-	}
-	projects, err := a.Store.Projects()
-	if err != nil {
-		return Workspace{}, Project{}, err
-	}
-	projectID := ""
-	if projectSelector != "" {
-		project, selectErr := selectProject(projects, projectSelector, true)
-		if selectErr != nil {
-			return Workspace{}, Project{}, selectErr
-		}
-		projectID = project.ID
-	}
-
-	canonicalCWD, _ := canonical(cwd)
-	currentMatches := []Workspace{}
-	for _, workspace := range workspaces {
-		if projectID != "" && workspace.ProjectID != projectID {
-			continue
-		}
-		worktreePath, pathErr := canonical(workspace.WorktreePath)
-		if pathErr == nil && isWithin(canonicalCWD, worktreePath, false) {
-			currentMatches = append(currentMatches, workspace)
-		}
-	}
-	if len(currentMatches) == 1 {
-		if currentMatches[0].State != StateReady {
-			return Workspace{}, Project{}, workspaceNotReadyError(currentMatches[0])
-		}
-		for _, project := range projects {
-			if project.ID == currentMatches[0].ProjectID {
-				return currentMatches[0], project, nil
-			}
-		}
-		return Workspace{}, Project{}, NewError("project_not_found", "Workspace references a missing Project.")
-	}
-	if len(currentMatches) > 1 {
-		appErr := NewError("workspace_ambiguous", fmt.Sprintf("Current directory belongs to multiple Workspaces: %s. Run gws apply <workspace-id>.", workspaceIDs(currentMatches)))
-		appErr.Details["candidates"] = currentMatches
-		return Workspace{}, Project{}, appErr
-	}
-
-	var project Project
-	if projectID != "" {
-		for _, candidate := range projects {
-			if candidate.ID == projectID {
-				project = candidate
-				break
-			}
-		}
-	} else {
-		project, err = a.resolveProjectUnlocked(ctx, "", cwd)
-		if err != nil {
-			return Workspace{}, Project{}, err
-		}
-		projectID = project.ID
-	}
-
-	matches := []Workspace{}
-	for _, workspace := range workspaces {
-		if workspace.ProjectID == projectID && workspace.State == StateReady && !workspace.Source.Detached {
-			matches = append(matches, workspace)
-		}
-	}
-	if len(matches) == 0 {
-		return Workspace{}, Project{}, NewError("workspace_not_found", fmt.Sprintf("No applicable Workspace was found for Project %q. Run gws new or specify a Workspace ID.", project.Name))
-	}
-	if len(matches) > 1 {
-		appErr := NewError("workspace_ambiguous", fmt.Sprintf("Project %q has multiple applicable Workspaces: %s. Run gws apply <workspace-id>.", project.Name, workspaceIDs(matches)))
-		appErr.Details["candidates"] = matches
-		return Workspace{}, Project{}, appErr
-	}
-	return matches[0], project, nil
+	return matches[0], nil
 }
 
 func workspaceIDs(workspaces []Workspace) string {
@@ -599,127 +289,72 @@ func workspaceNotReadyError(workspace Workspace) error {
 	return NewError("workspace_not_ready", fmt.Sprintf("Workspace %s is in %q state and cannot be applied. Inspect it with gws status %s, then repair or remove it.", workspace.ID, workspace.State, workspace.ID))
 }
 
-func (a *App) RemoveWorkspace(ctx context.Context, selector, projectSelector, cwd string, force bool) error {
+func (a *App) RemoveWorkspace(ctx context.Context, selector, cwd string, force bool) error {
 	return a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
-		if projectSelector == "" {
-			project, resolveErr := a.resolveProjectUnlocked(ctx, "", cwd)
-			if resolveErr != nil {
-				return resolveErr
-			}
-			projectSelector = project.ID
-		} else {
-			projects, listErr := a.Store.Projects()
-			if listErr != nil {
-				return listErr
-			}
-			project, selectErr := selectProject(projects, projectSelector, false)
-			if selectErr != nil {
-				return selectErr
-			}
-			projectSelector = project.ID
-		}
-		workspace, project, err := a.resolveWorkspaceUnlocked(ctx, selector, projectSelector, cwd, false)
+		workspace, err := a.resolveWorkspaceUnlocked(ctx, selector, cwd, false)
 		if err != nil {
 			return err
 		}
-		return a.removeWorkspaceUnlocked(ctx, workspace, project, force)
+		return a.removeWorkspaceUnlocked(ctx, workspace, force)
 	})
 }
 
-func (a *App) removeWorkspaceUnlocked(ctx context.Context, workspace Workspace, project Project, force bool) error {
-	if err := guardWorktreePath(a.Paths, project, workspace); err != nil {
+func (a *App) removeWorkspaceUnlocked(ctx context.Context, workspace Workspace, force bool) error {
+	if err := a.guardWorktreePath(workspace); err != nil {
 		return err
 	}
-	dirty, err := a.Git.IsDirty(ctx, workspace.WorktreePath)
-	if err != nil {
-		return err
-	}
-	if dirty && !force {
-		return NewError("workspace_dirty", "Workspace has uncommitted changes. Inspect it with gws status or use --force to discard it.")
+	if pathIsDir(workspace.WorktreePath) {
+		dirty, err := a.Git.IsDirty(ctx, workspace.WorktreePath)
+		if err != nil {
+			return err
+		}
+		if dirty && !force {
+			return NewError("workspace_dirty", "Workspace has uncommitted changes. Inspect it with gws status or use --force to discard it.")
+		}
 	}
 	workspace.State, workspace.UpdatedAt = StateRemoving, a.Now()
 	if err := a.Store.SaveWorkspace(workspace); err != nil {
 		return err
 	}
-	if err := a.Git.RemoveWorktree(ctx, project.RepoPath, workspace.WorktreePath, force); err != nil {
+	if err := a.Git.RemoveWorktree(ctx, a.Repo.Root, workspace.WorktreePath, force); err != nil {
 		workspace.State, workspace.LastError = StateError, err.Error()
 		_ = a.Store.SaveWorkspace(workspace)
 		return err
 	}
-	_ = a.Git.Prune(ctx, project.RepoPath)
+	_ = a.Git.Prune(ctx, a.Repo.Root)
 	if err := removeIfExists(workspace.TaskFilePath); err != nil {
 		return err
+	}
+	if workspace.Source.Managed {
+		if a.Git.RefExists(ctx, a.Repo.Root, workspace.Source.Ref) {
+			if err := a.Git.DeleteBranch(ctx, a.Repo.Root, workspace.Source.Ref, force); err != nil {
+				return WrapError("cleanup_branch_failed", fmt.Sprintf("Workspace worktree was removed, but managed branch %s could not be deleted.", workspace.Source.Ref), err)
+			}
+		}
 	}
 	return a.Store.DeleteWorkspace(workspace.ID)
 }
 
-func (a *App) ApplyWorkspace(ctx context.Context, selector, projectSelector, cwd string) (result ApplyResult, err error) {
+type ApplyRequest struct {
+	CWD  string
+	Into string
+}
+
+func (a *App) ApplyWorkspace(ctx context.Context, request ApplyRequest) (result ApplyResult, err error) {
 	err = a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
-		workspace, project, resolveErr := a.resolveApplyWorkspaceUnlocked(ctx, selector, projectSelector, cwd)
+		workspace, resolveErr := a.resolveWorkspaceUnlocked(ctx, "", request.CWD, false)
 		if resolveErr != nil {
 			return resolveErr
 		}
-		result, resolveErr = a.applyWorkspaceUnlocked(ctx, workspace, project)
+		result, resolveErr = a.applyWorkspaceUnlocked(ctx, workspace, request.Into)
 		return resolveErr
 	})
 	return
 }
 
-func (a *App) applyWorkspaceUnlocked(ctx context.Context, workspace Workspace, project Project) (ApplyResult, error) {
-	result := ApplyResult{Workspace: workspace, Project: project, SourceBranch: workspace.Source.Ref}
-	if workspace.State != StateReady {
-		return result, workspaceNotReadyError(workspace)
-	}
-	if workspace.Source.Detached {
-		return result, NewError("workspace_detached", "Detached review/test Workspaces cannot be applied directly. Create a branch and a development Workspace first.")
-	}
-	if !pathIsDir(workspace.WorktreePath) || !a.Git.IsWorktree(ctx, workspace.WorktreePath) {
-		return result, NewError("workspace_missing", "Workspace worktree is missing or is no longer registered with Git.")
-	}
-	workspaceRepo, err := a.Git.DetectRepository(ctx, workspace.WorktreePath)
-	if err != nil {
-		return result, err
-	}
-	if workspaceRepo.CurrentBranch == "" || workspaceRepo.CurrentBranch != workspace.Source.Ref {
-		return result, NewError("workspace_branch_mismatch", fmt.Sprintf("Workspace is on branch %q, but its registered source is %q.", workspaceRepo.CurrentBranch, workspace.Source.Ref))
-	}
-	dirty, err := a.Git.IsDirty(ctx, workspace.WorktreePath)
-	if err != nil {
-		return result, err
-	}
-	if dirty {
-		return result, NewError("workspace_dirty", "Workspace has uncommitted changes. Commit them before running gws apply.")
-	}
-	targetRepo, err := a.Git.DetectRepository(ctx, project.RepoPath)
-	if err != nil {
-		return result, err
-	}
-	if targetRepo.GitCommonDir != project.GitCommonDir {
-		return result, NewError("project_not_found", "The registered original checkout no longer belongs to this Project.")
-	}
-	if targetRepo.CurrentBranch == "" {
-		return result, NewError("target_detached", "The original checkout is in detached HEAD state. Switch it to the destination branch before applying.")
-	}
-	result.TargetBranch = targetRepo.CurrentBranch
-	if result.TargetBranch == result.SourceBranch {
-		return result, NewError("apply_same_branch", "Source and target are the same branch; there is nothing to apply.")
-	}
-	targetDirty, err := a.Git.IsDirty(ctx, project.RepoPath)
-	if err != nil {
-		return result, err
-	}
-	if targetDirty {
-		return result, NewError("target_dirty", fmt.Sprintf("Target branch %q has uncommitted changes. Clean the original checkout before applying.", result.TargetBranch))
-	}
-	if err := a.Git.Merge(ctx, project.RepoPath, result.SourceBranch); err != nil {
-		return result, err
-	}
-	return result, nil
-}
-
-func (a *App) FinishWorkspace(ctx context.Context, selector, projectSelector, cwd string) (result ApplyResult, err error) {
+func (a *App) FinishWorkspace(ctx context.Context, selector, into, cwd string) (result ApplyResult, err error) {
 	err = a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
-		workspace, project, resolveErr := a.resolveWorkspaceUnlocked(ctx, selector, projectSelector, cwd, false)
+		workspace, resolveErr := a.resolveWorkspaceUnlocked(ctx, selector, cwd, false)
 		if resolveErr != nil {
 			return resolveErr
 		}
@@ -728,31 +363,109 @@ func (a *App) FinishWorkspace(ctx context.Context, selector, projectSelector, cw
 		if canonicalErr == nil && worktreeErr == nil && isWithin(canonicalCWD, canonicalWorktree, false) {
 			return NewError("workspace_in_use", fmt.Sprintf("Exit Workspace %s first, then run gws finish %s from the original repository.", workspace.Name, workspace.ID))
 		}
-		result, resolveErr = a.applyWorkspaceUnlocked(ctx, workspace, project)
+		result, resolveErr = a.applyWorkspaceUnlocked(ctx, workspace, into)
 		if resolveErr != nil {
 			return resolveErr
 		}
-		if removeErr := a.removeWorkspaceUnlocked(ctx, workspace, project, false); removeErr != nil {
+		if removeErr := a.removeWorkspaceUnlocked(ctx, workspace, false); removeErr != nil {
 			return WrapError("finish_cleanup_failed", fmt.Sprintf("Changes were applied to %s, but Workspace cleanup failed. The source branch was preserved.", result.TargetBranch), removeErr)
-		}
-		if workspace.Source.Managed {
-			if branchErr := a.Git.DeleteBranch(ctx, project.RepoPath, workspace.Source.Ref, false); branchErr != nil {
-				return WrapError("finish_cleanup_failed", fmt.Sprintf("Workspace was applied to %s and removed, but its managed branch %s could not be deleted.", result.TargetBranch, workspace.Source.Ref), branchErr)
-			}
 		}
 		return nil
 	})
 	return
 }
 
-func (a *App) Status(ctx context.Context, selector, projectSelector, cwd string) (status Status, err error) {
+func (a *App) applyWorkspaceUnlocked(ctx context.Context, workspace Workspace, into string) (result ApplyResult, err error) {
+	result = ApplyResult{Workspace: workspace, RepoRoot: a.Repo.Root, SourceBranch: workspace.Source.Ref}
+	fail := func(code, message string) (ApplyResult, error) {
+		err := NewError(code, message)
+		err.Details["workspace_id"] = workspace.ID
+		err.Details["source_branch"] = workspace.Source.Ref
+		return result, err
+	}
+	if workspace.State != StateReady {
+		return fail("workspace_not_ready", fmt.Sprintf("Workspace %s is in %q state and cannot be applied. Inspect it with gws status %s, then repair or remove it.", workspace.ID, workspace.State, workspace.ID))
+	}
+	if workspace.Source.Detached {
+		return fail("workspace_detached", "Detached review/test Workspaces cannot be applied. They are read-only; create a development Workspace instead.")
+	}
+	if !pathIsDir(workspace.WorktreePath) || !a.Git.IsWorktree(ctx, workspace.WorktreePath) {
+		return fail("workspace_missing", "Workspace worktree is missing or is no longer registered with Git.")
+	}
+	workspaceRepo, err := a.Git.DetectRepository(ctx, workspace.WorktreePath)
+	if err != nil {
+		return result, err
+	}
+	if workspaceRepo.CurrentBranch == "" || workspaceRepo.CurrentBranch != workspace.Source.Ref {
+		return fail("workspace_branch_mismatch", fmt.Sprintf("Workspace is on branch %q, but its registered source is %q.", workspaceRepo.CurrentBranch, workspace.Source.Ref))
+	}
+	dirty, err := a.Git.IsDirty(ctx, workspace.WorktreePath)
+	if err != nil {
+		return result, err
+	}
+	if dirty {
+		return fail("workspace_dirty", "Workspace has uncommitted changes. Commit them before running gws apply.")
+	}
+
+	target := into
+	if target == "" {
+		target = workspace.Source.BaseRef
+	}
+	explicit := into != ""
+	if shaPattern.MatchString(target) && !a.Git.IsBranch(ctx, a.Repo.Root, target) {
+		if !explicit {
+			return fail("apply_sha_target", fmt.Sprintf("Base %q is a commit SHA, not a branch; it cannot receive a merge. Pass a branch with --into <branch>.", target))
+		}
+		return fail("git_ref_not_found", fmt.Sprintf("Target branch %q does not exist.", target))
+	}
+	if target == result.SourceBranch {
+		return fail("apply_same_branch", "Source and target are the same branch; there is nothing to apply.")
+	}
+	if !a.Git.RefExists(ctx, a.Repo.Root, target) {
+		return fail("git_ref_not_found", fmt.Sprintf("Target branch %q does not exist.", target))
+	}
+
+	mainTree, err := a.Git.MainWorktree(ctx, a.Repo.Root)
+	if err != nil {
+		return result, err
+	}
+	result.RepoRoot = mainTree
+	mainRepo, err := a.Git.DetectRepository(ctx, mainTree)
+	if err != nil {
+		return result, err
+	}
+	if mainRepo.CurrentBranch == "" {
+		return fail("target_detached", fmt.Sprintf("The main checkout %s is in detached HEAD state. Check out %s before applying.", mainTree, target))
+	}
+	if mainRepo.CurrentBranch != target {
+		return fail("apply_target_not_checked_out", fmt.Sprintf("The main checkout %s is on branch %q, not the target %q. Run: git -C %s checkout %s, or apply into another branch with --into %s.", mainTree, mainRepo.CurrentBranch, target, mainTree, target, mainRepo.CurrentBranch))
+	}
+	targetDirty, err := a.Git.IsDirty(ctx, mainTree)
+	if err != nil {
+		return result, err
+	}
+	if targetDirty {
+		return fail("target_dirty", fmt.Sprintf("Target branch %q has uncommitted changes in %s. Clean the main checkout before applying.", target, mainTree))
+	}
+	if err := a.Git.Merge(ctx, mainTree, result.SourceBranch); err != nil {
+		var appErr *AppError
+		if errors.As(err, &appErr) && appErr.Code == "merge_failed" {
+			return result, NewError("merge_conflict", fmt.Sprintf("Merge of %s into %s conflicts. Resolve it in %s, or run: git -C %s merge --abort. The Workspace was not cleaned up.", result.SourceBranch, target, mainTree, mainTree))
+		}
+		return result, err
+	}
+	result.TargetBranch = target
+	return result, nil
+}
+
+func (a *App) Status(ctx context.Context, selector, cwd string) (status Status, err error) {
 	err = a.Locker.WithShared(ctx, func(ctx context.Context) error {
-		workspace, project, resolveErr := a.resolveWorkspaceUnlocked(ctx, selector, projectSelector, cwd, true)
+		workspace, resolveErr := a.resolveWorkspaceUnlocked(ctx, selector, cwd, true)
 		if resolveErr != nil {
 			return resolveErr
 		}
 		status.Workspace = workspace
-		status.RepoExists = pathIsDir(project.RepoPath)
+		status.RepoRoot = a.Repo.Root
 		status.WorktreeExists = pathIsDir(workspace.WorktreePath)
 		status.TaskExists = pathIsFile(workspace.TaskFilePath)
 		if status.WorktreeExists {
@@ -763,6 +476,112 @@ func (a *App) Status(ctx context.Context, selector, projectSelector, cwd string)
 			}
 			status.Dirty = &dirty
 		}
+		return nil
+	})
+	return
+}
+
+func (a *App) baseCommitFor(ctx context.Context, workspace Workspace) (string, error) {
+	if workspace.Source.BaseCommit != "" {
+		return workspace.Source.BaseCommit, nil
+	}
+	ref := firstNonEmpty(workspace.Source.BaseRef, workspace.Source.FromRef)
+	if ref == "" {
+		return "", NewError("git_ref_not_found", fmt.Sprintf("Workspace %s has no recorded base commit. Run gws show %s.", workspace.ID, workspace.ID))
+	}
+	return a.Git.ResolveCommit(ctx, a.Repo.Root, ref)
+}
+
+func (a *App) requireWorktree(workspace Workspace) error {
+	if !pathIsDir(workspace.WorktreePath) {
+		return NewError("workspace_missing", fmt.Sprintf("Workspace %s worktree is missing at %s. Run gws status %s.", workspace.ID, workspace.WorktreePath, workspace.ID))
+	}
+	return nil
+}
+
+func (a *App) DiffWorkspace(ctx context.Context, selector, cwd string, staged, stat, uncommitted bool) (result DiffResult, err error) {
+	err = a.Locker.WithShared(ctx, func(ctx context.Context) error {
+		workspace, resolveErr := a.resolveWorkspaceUnlocked(ctx, selector, cwd, true)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if missingErr := a.requireWorktree(workspace); missingErr != nil {
+			return missingErr
+		}
+		base, baseErr := a.baseCommitFor(ctx, workspace)
+		if baseErr != nil {
+			return baseErr
+		}
+		if uncommitted {
+			base = "HEAD"
+		}
+		content, diffErr := a.Git.Diff(ctx, workspace.WorktreePath, base, staged, stat)
+		if diffErr != nil {
+			return diffErr
+		}
+		untracked, untrackedErr := a.Git.UntrackedFiles(ctx, workspace.WorktreePath)
+		if untrackedErr != nil {
+			return untrackedErr
+		}
+		result = DiffResult{Workspace: workspace, Base: base, Content: content, Untracked: untracked}
+		return nil
+	})
+	return
+}
+
+func (a *App) LogWorkspace(ctx context.Context, selector, cwd string, limit int, stat bool) (result LogResult, err error) {
+	err = a.Locker.WithShared(ctx, func(ctx context.Context) error {
+		workspace, resolveErr := a.resolveWorkspaceUnlocked(ctx, selector, cwd, true)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if missingErr := a.requireWorktree(workspace); missingErr != nil {
+			return missingErr
+		}
+		base, baseErr := a.baseCommitFor(ctx, workspace)
+		if baseErr != nil {
+			return baseErr
+		}
+		content, logErr := a.Git.Log(ctx, workspace.WorktreePath, base, limit, stat)
+		if logErr != nil {
+			return logErr
+		}
+		result = LogResult{Workspace: workspace, Base: base, Content: content}
+		return nil
+	})
+	return
+}
+
+func (a *App) CommitWorkspace(ctx context.Context, cwd, message string, all bool) (result CommitResult, err error) {
+	err = a.Locker.WithExclusive(ctx, func(ctx context.Context) error {
+		workspace, resolveErr := a.resolveWorkspaceUnlocked(ctx, "", cwd, false)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if strings.TrimSpace(message) == "" {
+			return NewError("config_invalid", "Commit message is empty. Pass --message <text>.")
+		}
+		if workspace.Source.Detached {
+			return NewError("workspace_detached", "Detached review/test Workspaces are read-only and cannot commit. Create a development Workspace instead.")
+		}
+		if missingErr := a.requireWorktree(workspace); missingErr != nil {
+			return missingErr
+		}
+		dirty, dirtyErr := a.Git.IsDirty(ctx, workspace.WorktreePath)
+		if dirtyErr != nil {
+			return dirtyErr
+		}
+		if !dirty {
+			return NewError("workspace_clean", fmt.Sprintf("Nothing to commit in Workspace %s.", workspace.ID))
+		}
+		if commitErr := a.Git.Commit(ctx, workspace.WorktreePath, message, all); commitErr != nil {
+			return commitErr
+		}
+		commit, subject, summaryErr := a.Git.HeadSummary(ctx, workspace.WorktreePath)
+		if summaryErr != nil {
+			return summaryErr
+		}
+		result = CommitResult{Workspace: workspace, Commit: commit, Subject: subject}
 		return nil
 	})
 	return
@@ -792,7 +611,7 @@ func (a *App) GC(ctx context.Context, dryRun bool) (actions []GCAction, err erro
 			}
 		}
 		tasks, readErr := os.ReadDir(a.Paths.TasksDir())
-		if readErr != nil {
+		if readErr != nil && !os.IsNotExist(readErr) {
 			return WrapError("gc_scan_failed", fmt.Sprintf("Failed to scan task directory %s.", a.Paths.TasksDir()), readErr)
 		}
 		for _, entry := range tasks {
@@ -812,26 +631,16 @@ func (a *App) GC(ctx context.Context, dryRun bool) (actions []GCAction, err erro
 				actions = append(actions, action)
 			}
 		}
-		projectDirs, readErr := os.ReadDir(a.Paths.WorktreesDir())
-		if readErr != nil {
-			return WrapError("gc_scan_failed", fmt.Sprintf("Failed to scan worktree directory %s.", a.Paths.WorktreesDir()), readErr)
+		entries, readErr := os.ReadDir(a.Paths.WorktreesDir)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return WrapError("gc_scan_failed", fmt.Sprintf("Failed to scan worktree directory %s.", a.Paths.WorktreesDir), readErr)
 		}
-		for _, projectDir := range projectDirs {
-			if !projectDir.IsDir() {
+		for _, entry := range entries {
+			if !entry.IsDir() {
 				continue
 			}
-			projectWorktreesDir := filepath.Join(a.Paths.WorktreesDir(), projectDir.Name())
-			entries, readErr := os.ReadDir(projectWorktreesDir)
-			if readErr != nil {
-				return WrapError("gc_scan_failed", fmt.Sprintf("Failed to scan Project worktree directory %s.", projectWorktreesDir), readErr)
-			}
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					continue
-				}
-				if _, ok := known[entry.Name()]; !ok {
-					actions = append(actions, GCAction{Kind: "worktree", Path: filepath.Join(a.Paths.WorktreesDir(), projectDir.Name(), entry.Name()), WorkspaceID: entry.Name(), Action: "manual", Reason: "ownership cannot be fully proven without workspace metadata"})
-				}
+			if _, ok := known[entry.Name()]; !ok {
+				actions = append(actions, GCAction{Kind: "worktree", Path: filepath.Join(a.Paths.WorktreesDir, entry.Name()), WorkspaceID: entry.Name(), Action: "manual", Reason: "ownership cannot be fully proven without workspace metadata"})
 			}
 		}
 		sort.Slice(actions, func(i, j int) bool { return actions[i].Path < actions[j].Path })
@@ -840,18 +649,19 @@ func (a *App) GC(ctx context.Context, dryRun bool) (actions []GCAction, err erro
 	return
 }
 
-func guardWorktreePath(paths Paths, project Project, workspace Workspace) error {
+func (a *App) guardWorktreePath(workspace Workspace) error {
 	target, err := canonical(workspace.WorktreePath)
 	if err != nil {
 		return WrapError("workspace_path_unsafe", "Could not canonicalize Workspace path.", err)
 	}
-	root, err := canonical(paths.WorktreesDir())
+	root, err := canonical(a.Paths.WorktreesDir)
 	if err != nil {
 		return err
 	}
-	expected, _ := canonical(paths.WorktreePath(project.ID, workspace.ID))
-	repo, _ := canonical(project.RepoPath)
-	if target != expected || target == root || target == repo || !isWithin(target, root, true) {
+	expected, _ := canonical(a.Paths.WorktreePath(workspace.ID))
+	repo, _ := canonical(a.Repo.Root)
+	parent, _ := canonical(filepath.Dir(repo))
+	if target != expected || target == root || target == repo || target == parent || !isWithin(target, root, true) {
 		return NewError("workspace_path_unsafe", fmt.Sprintf("Refusing to remove unsafe Workspace path %s.", target))
 	}
 	if info, lerr := os.Lstat(workspace.WorktreePath); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
@@ -880,16 +690,6 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
-func defaultWorkspaceName(kind WorkspaceType, ref string) string {
-	base := filepath.Base(ref)
-	if kind == WorkspaceReview {
-		return "review-" + base
-	}
-	if kind == WorkspaceTest {
-		return "test-" + base
-	}
-	return base
-}
 func slug(value string) string {
 	var b strings.Builder
 	dash := false
@@ -908,25 +708,6 @@ func slug(value string) string {
 		result = strings.TrimRight(string(runes[:48]), "-")
 	}
 	return result
-}
-func uniqueProjectID(projects []Project, base string) (string, error) {
-	if base == "" {
-		base = "project"
-	}
-	used := map[string]bool{}
-	for _, p := range projects {
-		used[p.ID] = true
-	}
-	for i := 0; i < 16; i++ {
-		id, err := randomID(base)
-		if err != nil {
-			return "", err
-		}
-		if !used[id] {
-			return id, nil
-		}
-	}
-	return "", errors.New("could not allocate unique project id")
 }
 func uniqueWorkspaceID(workspaces []Workspace, base string) (string, error) {
 	used := map[string]bool{}

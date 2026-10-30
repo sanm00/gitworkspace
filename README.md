@@ -6,11 +6,9 @@
 
 [简体中文](README.zh.md)
 
-Git Workspace is a Git worktree manager with a work-item model, automatic branch
-policy, guarded cleanup, and an explicit apply/finish workflow.
-
-It is useful on its own and can also serve as the source-workspace plugin of a
-larger development-environment isolation platform.
+Git Workspace (`gws`) carves isolated worktrees out of the branch you are on and
+merges them back safely. It exists for two moments: triaging a problem while you
+keep developing, and working on several things at once in the same repository.
 
 > **Project status:** pre-1.0. CLI and JSON compatibility are treated carefully,
 > but incompatible changes may still be introduced with migration notes.
@@ -20,21 +18,15 @@ larger development-environment isolation platform.
 Git Workspace owns the lifecycle of source workspaces:
 
 ```text
-work item -> managed branch -> Git worktree -> apply or finish
+base branch -> managed branch (gws/<name>) -> Git worktree -> apply or finish
 ```
 
-Git Workspace does not launch coding agents, editors, containers, databases, host
-processes, or network services. A platform may resolve a managed Workspace and
-provision those resources around its worktree path.
-
-The filesystem isolation comes from Git worktree. Git Workspace adds naming,
-metadata, locking, rollback, ownership checks, diagnostics, and lifecycle
-policy; it does not claim process, port, dependency, credential, or runtime
-isolation.
+It does not launch coding agents, editors, containers, databases, host
+processes, or network services. The filesystem isolation comes from Git
+worktree; `gws` adds naming, base tracking, locking, rollback, ownership
+checks, diagnostics, and lifecycle policy.
 
 ## Install
-
-Install the latest tagged version with Go:
 
 ```bash
 go install github.com/sanm00/gitworkspace/cmd/gws@latest
@@ -64,115 +56,138 @@ make build VERSION=v0.1.0-test
 
 ## Quick start
 
-Initialize Git when needed and register the current directory as a Project:
+You are developing on `feature-x` and need a second, isolated copy of the same
+baseline — to triage a bug, or to try something without disturbing your work:
 
 ```bash
 cd ~/projects/example
-gws init --name example --default-branch main
+git checkout feature-x
+gws new
 ```
 
-`init` always treats the current directory as the Project root. If that exact
-directory is not already a Git repository root, it runs `git init` there first,
-including when the directory is nested inside a parent repository. The
-configured or explicitly requested default branch is used as the initial branch.
+`gws new` needs no arguments. It bases the Workspace on the current branch,
+creates a managed branch `gws/<name>` at that exact commit, opens a worktree in
+a sibling directory (`../example-gws/<id>/`), stores its metadata under
+`.git/gws/`, and drops you into a shell there. When you are done, `exit`.
 
-Create a Workspace from the current branch and enter its child shell. The work
-item name is optional:
+Every command reports the baseline it used:
+
+```text
+Created Workspace feature-x-9f2c
+Type: dev
+Based on: feature-x (1a2b3c4d)
+Branch: gws/feature-x
+Worktree: /Users/you/projects/example-gws/feature-x-9f2c
+```
+
+To enter an existing Workspace later:
 
 ```bash
-gws new feature/avatar
-gws checkout feature-avatar
+gws use feature-x-9f2c     # by ID, prefix, or name
 ```
 
-Running `gws new` without a name uses `workspace` as its generated label. The
-randomized Workspace ID and managed branch remain unique.
-
-`new` creates a globally unique branch managed by Git Workspace. When supplied,
-the work-item name is only a human-readable label, not a Git branch name, so an
-existing `feature/avatar` branch does not conflict.
-The same work-item name may have multiple Workspaces; use the displayed ID when
-a name is ambiguous.
-
-`new` always selects the repository from the current directory and does not accept
-`--project`. It automatically registers the current repository when needed. Use
-`--from REF` when the Workspace should start from a ref other than the current
-branch. If the repository has no commits, `new` creates an empty initial commit
-automatically without committing or clearing staged changes. If automatic
-registration encounters a parent/current-directory relationship, `new` still
-initializes and registers the current directory.
-
-Commit changes inside the Workspace, then choose one of these outcomes:
+Inside the Workspace, commit your changes as usual. Then merge them back:
 
 ```bash
-gws apply
+gws apply                  # merge into the base branch; keeps the Workspace
 ```
 
-`apply` merges the committed Workspace branch into the branch currently checked
-out in the registered original repository and keeps the Workspace. Without a
-Workspace argument, it uses the Workspace containing the current directory;
-otherwise it selects the sole applicable Workspace belonging to the current
-Project. Multiple candidates produce an error listing their IDs.
+`apply` runs from inside the Workspace and targets its base branch by default
+(`--into <branch>` overrides). Before merging it validates every precondition —
+clean worktrees, target branch checked out in the main checkout, no conflicts —
+and stops with an actionable reason instead of touching anything:
+
+```text
+! The main checkout ... is on branch "main", not the target "feature-x".
+  Run: git -C ... checkout feature-x, or apply into another branch with --into main.
+```
+
+When you are finished for good, run from the main checkout:
 
 ```bash
-exit
-gws finish feature-avatar
+gws finish feature-x-9f2c  # merge back, then remove worktree and managed branch
 ```
 
-`finish` applies first and removes the worktree and managed branch only after a
-successful merge.
+`finish` applies first and cleans up only after a successful merge.
+
+## Other workspace types
+
+```bash
+gws new --base pull/123/head --type review   # detached, read-only inspection
+gws new --base v0.9.0 --type test            # detached, reproduce against a tag
+gws new hotfix --base main --type fix        # managed branch off main, like dev
+```
+
+`review` and `test` worktrees are detached: they cannot be applied, which is
+the safety guarantee for read-only triage. `--fetch` refreshes remote refs
+first and is accepted only with these two types.
+
+## Everyday Git, wrapped
+
+`gws` also wraps the Git commands you run most inside a Workspace, so you do not
+have to remember the base commit or re-type its path:
+
+```bash
+gws commit -m "fix avatar upload" -a   # commit inside the Workspace
+gws diff                              # everything this Workspace changed since its base
+gws diff --uncommitted                # only what is not committed yet
+gws diff --staged --stat              # staged changes as a summary
+gws log -n 5                          # commits on top of the base
+```
+
+`gws diff` prints ordinary `git diff` output and lists untracked files
+separately, because Git never includes them in a diff. `gws commit` refuses
+detached review/test Workspaces, which are read-only by design.
 
 ## Core commands
 
 ```text
-gws init
-gws new
-gws checkout
-gws apply
-gws finish
-gws ls|show|status|path
-gws rm
-gws project ls|show|rm
-gws gc
+gws new [NAME] [--base BRANCH|SHA] [--type dev|fix|review|test] [--detach] [--fetch] [--no-enter] [--json]
+gws use [WORKSPACE]
+gws commit --message MESSAGE [-a] [--json]
+gws diff [WORKSPACE] [--staged] [--stat] [--uncommitted] [--json]
+gws log [WORKSPACE] [-n N] [--stat] [--json]
+gws apply [--into BRANCH]
+gws finish WORKSPACE [--into BRANCH]
+gws ls | show | status | path [WORKSPACE]
+gws rm WORKSPACE [--force]
+gws gc [--dry-run]
 gws doctor
-gws capabilities
+gws capabilities [--json]
 ```
 
-Advanced `dev`, `review`, `fix`, and `test` commands attach explicit branches or
-create detached inspection worktrees.
+`--help`, `--version`, and `capabilities` work anywhere; every other command
+must run inside a Git repository.
 
 ## Safety model
 
 - State mutations are serialized with an inter-process lock.
 - Workspace creation records `creating` state and rolls back partial resources.
-- Normal removal refuses dirty worktrees.
-- `gws rm` is scoped to the current repository unless `--project` is explicit.
-- `--force` bypasses only the dirty check, never path ownership checks.
-- `finish` does not clean up when apply fails.
-- Only branches explicitly marked as owned by Git Workspace are automatically deleted.
-- `gc --dry-run` reports cleanup actions before they are applied.
+- Managed branches live in the `gws/` namespace and carry an ownership flag;
+  only owned branches are ever deleted automatically.
+- `apply`/`finish` check all preconditions first and report blocking reasons
+  instead of half-applying; `finish` never cleans up when the merge fails.
+- Normal removal refuses dirty worktrees. `--force` bypasses only the dirty
+  check, never path ownership checks.
+- `gc` prunes metadata for vanished worktrees but never deletes user branches.
 
 ## Platform/plugin integration
 
-The plugin boundary is the `gws` process. Platforms should discover it
-instead of assuming features:
+All non-interactive commands accept `--json` and emit a versioned envelope
+(schema version 2, protocol version 2):
 
 ```bash
-gws capabilities --json
-```
-
-All non-interactive lifecycle and inspection commands accept `--json` and emit a
-versioned envelope. For example:
-
-```bash
-gws new issue-328 --json
+gws new issue-328 --no-enter --json
 gws show issue-328 --json
 gws path issue-328 --json
 gws finish issue-328 --json
 ```
 
-`checkout` is intentionally interactive and does not support JSON. A platform
-uses `path --json`, then launches its own runtime with that path as the working
-directory. See [GIT_WORKSPACE_IMPLEMENTATION_SPEC.md](GIT_WORKSPACE_IMPLEMENTATION_SPEC.md)
+`use` is intentionally interactive and rejects `--json`. A platform uses
+`path --json`, then launches its own runtime with that path as the working
+directory. With `--json` (or when stdout is not a terminal), `new` creates the
+Workspace without entering a shell. See
+[GIT_WORKSPACE_IMPLEMENTATION_SPEC.md](GIT_WORKSPACE_IMPLEMENTATION_SPEC.md)
 for the contract.
 
 Packages under `internal/` are not a public Go API. The supported integration
@@ -180,24 +195,30 @@ interface is the versioned `gws --json` subprocess protocol.
 
 ## Configuration and state
 
-Optional repository configuration lives at `.git-workspace.yaml`:
+Everything `gws` persists lives inside the repository:
 
-```yaml
-version: 1
-
-project:
-  name: example
-  default_branch: main
+```text
+<repo>/.git/gws/config.json          optional configuration
+<repo>/.git/gws/workspaces/<id>.json workspace metadata
+<repo>/.git/gws/tasks/<id>.md        task brief for coding agents
+<repo>/.git/gws/locks/state.lock     inter-process lock
+<parent>/<repo>-gws/<id>/            worktree checkout
 ```
 
-This file is not required and `gws` does not create it automatically. Without
-it, the Project name comes from the current directory and the default branch
-comes from Git.
+Metadata sits under the Git common directory, so all worktrees of one
+repository share the same state, and cloning the repository carries nothing
+over. Optional configuration is `.git/gws/config.json`:
 
-Global state defaults to `~/.git-workspace` and can be overridden with
-`GIT_WORKSPACE_HOME`. Persisted Project and Workspace records include a state
-format version. Legacy unversioned records are read as version 1; records from
-newer unsupported formats are rejected rather than overwritten.
+```json
+{ "version": 1, "default_branch": "main" }
+```
+
+`default_branch` is the fallback base when HEAD is detached and no `--base` is
+given. `gws` never creates this file automatically.
+
+Persisted records carry a state format version. Legacy unversioned records are
+read as version 1; records from newer unsupported formats are rejected rather
+than overwritten.
 
 ## Contributing and security
 

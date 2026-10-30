@@ -7,28 +7,41 @@ import (
 	"time"
 )
 
-func TestStoreRoundTrip(t *testing.T) {
-	paths := Paths{Home: t.TempDir()}
-	if err := paths.Ensure(); err != nil {
+func testPaths(t *testing.T) Paths {
+	t.Helper()
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	store := Store{Paths: paths}
-	now := time.Now().UTC().Truncate(time.Second)
-	project := Project{ID: "demo", Name: "Demo", RepoPath: "/repo", GitCommonDir: "/repo/.git", DefaultBranch: "main", ConfigPath: "/repo/.git-workspace.yaml", CreatedAt: now, UpdatedAt: now}
-	if err := store.SaveProject(project); err != nil {
-		t.Fatal(err)
-	}
-	got, err := store.Project("demo")
+	paths, err := NewPaths(Repository{Root: repo, GitCommonDir: filepath.Join(repo, ".git")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != project.ID || !got.CreatedAt.Equal(now) {
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
+func TestStoreRoundTrip(t *testing.T) {
+	paths := testPaths(t)
+	store := Store{Paths: paths}
+	now := time.Now().UTC().Truncate(time.Second)
+	workspace := Workspace{ID: "demo", Name: "Demo", Type: WorkspaceDev, Source: SourceSpec{Kind: "branch", Ref: "gws/demo", BaseRef: "main", BaseCommit: "abc123"}, WorktreePath: paths.WorktreePath("demo"), TaskFilePath: paths.TaskFile("demo"), State: StateReady, CreatedAt: now, UpdatedAt: now}
+	if err := store.SaveWorkspace(workspace); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Workspace("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != workspace.ID || got.Source.BaseCommit != "abc123" || !got.CreatedAt.Equal(now) {
 		t.Fatalf("round trip mismatch: %#v", got)
 	}
 	if got.StateVersion != CurrentStateVersion {
 		t.Fatalf("state version=%d", got.StateVersion)
 	}
-	info, err := os.Stat(paths.ProjectFile("demo"))
+	info, err := os.Stat(paths.WorkspaceFile("demo"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,53 +51,56 @@ func TestStoreRoundTrip(t *testing.T) {
 }
 
 func TestStoreAcceptsLegacyStateAndRejectsFutureState(t *testing.T) {
-	paths := Paths{Home: t.TempDir()}
-	if err := paths.Ensure(); err != nil {
-		t.Fatal(err)
-	}
+	paths := testPaths(t)
 	store := Store{Paths: paths}
 	legacy := []byte(`{"id":"legacy","name":"Legacy"}`)
-	if err := os.WriteFile(paths.ProjectFile("legacy"), legacy, 0o600); err != nil {
+	if err := os.WriteFile(paths.WorkspaceFile("legacy"), legacy, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	project, err := store.Project("legacy")
-	if err != nil || project.StateVersion != CurrentStateVersion {
-		t.Fatalf("legacy state was not upgraded in memory: project=%#v err=%v", project, err)
+	workspace, err := store.Workspace("legacy")
+	if err != nil || workspace.StateVersion != CurrentStateVersion {
+		t.Fatalf("legacy state was not upgraded in memory: workspace=%#v err=%v", workspace, err)
 	}
 
 	future := []byte(`{"state_version":2,"id":"future","name":"Future"}`)
-	if err := os.WriteFile(paths.ProjectFile("future"), future, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Project("future"); ErrorCode(err) != "state_version_unsupported" {
-		t.Fatalf("future state error=%v", err)
-	}
 	if err := os.WriteFile(paths.WorkspaceFile("future"), future, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Workspace("future"); ErrorCode(err) != "state_version_unsupported" {
-		t.Fatalf("future Workspace state error=%v", err)
+		t.Fatalf("future state error=%v", err)
 	}
 }
 
 func TestGuardWorktreePath(t *testing.T) {
-	paths := Paths{Home: t.TempDir()}
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := NewPaths(Repository{Root: repo, GitCommonDir: filepath.Join(repo, ".git")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := paths.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	project := Project{ID: "p", RepoPath: filepath.Join(paths.Home, "repo")}
-	if err := os.MkdirAll(project.RepoPath, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	workspace := Workspace{ID: "w", ProjectID: "p", WorktreePath: paths.WorktreePath("p", "w")}
+	app := &App{Paths: paths, Repo: Repository{Root: repo, GitCommonDir: filepath.Join(repo, ".git")}}
+	workspace := Workspace{ID: "w", WorktreePath: paths.WorktreePath("w")}
 	if err := os.MkdirAll(workspace.WorktreePath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := guardWorktreePath(paths, project, workspace); err != nil {
+	if err := app.guardWorktreePath(workspace); err != nil {
 		t.Fatalf("safe path rejected: %v", err)
 	}
-	workspace.WorktreePath = project.RepoPath
-	if err := guardWorktreePath(paths, project, workspace); ErrorCode(err) != "workspace_path_unsafe" {
-		t.Fatalf("unsafe path error=%v", err)
+	workspace.WorktreePath = repo
+	if err := app.guardWorktreePath(workspace); ErrorCode(err) != "workspace_path_unsafe" {
+		t.Fatalf("repo root error=%v", err)
+	}
+	workspace.WorktreePath = filepath.Dir(repo)
+	if err := app.guardWorktreePath(workspace); ErrorCode(err) != "workspace_path_unsafe" {
+		t.Fatalf("parent dir error=%v", err)
+	}
+	workspace.WorktreePath = paths.WorktreesDir
+	if err := app.guardWorktreePath(workspace); ErrorCode(err) != "workspace_path_unsafe" {
+		t.Fatalf("worktrees root error=%v", err)
 	}
 }

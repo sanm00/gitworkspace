@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -30,47 +31,65 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 		return 0
 	}
 	command := args[0]
-	rest := args[1:]
-	parsed, parseErr := parse(rest)
-	jsonMode := parsed.bool("json")
+	if command == "capabilities" {
+		parsed, parseErr := parse("capabilities", args[1:])
+		if parseErr != nil {
+			return fail(streams, command, false, parseErr)
+		}
+		if err := runCapabilities(parsed, streams); err != nil {
+			return fail(streams, command, parsed.bool("json"), err)
+		}
+		return 0
+	}
+	parsed, parseErr := parse(command, args[1:])
+	useJSON := command == "use" && parsed.bool("json")
+	jsonMode := parsed.bool("json") && !useJSON
+	if useJSON {
+		parseErr = gitworkspace.NewError("config_invalid", "use is interactive and does not support --json. Use path --json for platform integration.")
+	}
 	if parseErr != nil {
 		return fail(streams, command, jsonMode, parseErr)
 	}
-	paths, err := gitworkspace.DefaultPaths()
-	if err != nil {
-		return fail(streams, args[0], false, err)
-	}
-	app, err := gitworkspace.NewApp(paths)
-	if err != nil {
-		return fail(streams, args[0], false, err)
-	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return fail(streams, args[0], false, err)
+		return fail(streams, command, jsonMode, err)
 	}
+	git := gitworkspace.Git{Runner: gitworkspace.Runner{}}
+	repo, err := git.DetectRepository(context.Background(), cwd)
+	if err != nil {
+		return fail(streams, command, jsonMode, gitworkspace.NewError("repository_not_found", "Current directory is not inside a Git repository. Run gws from a repository checkout."))
+	}
+	paths, err := gitworkspace.NewPaths(repo)
+	if err != nil {
+		return fail(streams, command, jsonMode, err)
+	}
+	if err := paths.Ensure(); err != nil {
+		return fail(streams, command, jsonMode, err)
+	}
+	app := gitworkspace.NewApp(paths, repo)
 	ctx := context.Background()
 	var runErr error
 	switch command {
-	case "init":
-		runErr = runInit(ctx, app, cwd, parsed, streams)
-	case "project":
-		runErr = runProject(ctx, app, cwd, parsed, streams)
 	case "new":
 		runErr = runNew(ctx, app, cwd, parsed, streams)
-	case "checkout":
-		runErr = runCheckout(ctx, app, cwd, parsed, streams)
+	case "use":
+		runErr = runUse(ctx, app, cwd, parsed, streams)
 	case "apply":
 		runErr = runApply(ctx, app, cwd, parsed, streams)
 	case "finish":
 		runErr = runFinish(ctx, app, cwd, parsed, streams)
-	case "dev", "review", "fix", "test":
-		runErr = runCreate(ctx, app, cwd, command, parsed, streams)
 	case "ls":
 		runErr = runList(ctx, app, parsed, streams)
 	case "show":
 		runErr = runShow(ctx, app, cwd, parsed, streams)
 	case "status":
 		runErr = runStatus(ctx, app, cwd, parsed, streams)
+	case "diff":
+		runErr = runDiff(ctx, app, cwd, parsed, streams)
+	case "log":
+		runErr = runLog(ctx, app, cwd, parsed, streams)
+	case "commit":
+		runErr = runCommit(ctx, app, cwd, parsed, streams)
 	case "path":
 		runErr = runPath(ctx, app, cwd, parsed, streams)
 	case "rm":
@@ -78,9 +97,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 	case "gc":
 		runErr = runGC(ctx, app, parsed, streams)
 	case "doctor":
-		runErr = runDoctor(ctx, app, cwd, parsed, streams)
-	case "capabilities":
-		runErr = runCapabilities(parsed, streams)
+		runErr = runDoctor(ctx, app, parsed, streams)
 	default:
 		runErr = gitworkspace.NewError("config_invalid", fmt.Sprintf("Unknown command %q. Run gws --help.", command))
 	}
@@ -96,22 +113,37 @@ type parsedArgs struct {
 	flags      map[string]bool
 }
 
-func parse(args []string) (parsedArgs, error) {
+var valueFlags = map[string]bool{"base": true, "type": true, "into": true, "limit": true, "message": true}
+var boolFlags = map[string]bool{"json": true, "detach": true, "fetch": true, "no-enter": true, "force": true, "dry-run": true, "staged": true, "stat": true, "uncommitted": true, "all": true}
+
+var shortFlags = map[string]string{"-m": "message", "-n": "limit", "-a": "all"}
+
+func parse(command string, args []string) (parsedArgs, error) {
 	p := parsedArgs{values: map[string]string{}, flags: map[string]bool{}}
-	bools := map[string]bool{"json": true, "new": true, "fetch": true, "force": true, "dry-run": true}
-	values := map[string]bool{"name": true, "default-branch": true, "project": true, "from": true, "base": true}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+		if long, ok := shortFlags[arg]; ok {
+			if long == "all" {
+				p.flags[long] = true
+				continue
+			}
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return p, gitworkspace.NewError("config_invalid", fmt.Sprintf("Option %s requires a value.", arg))
+			}
+			i++
+			p.values[long] = args[i]
+			continue
+		}
 		if !strings.HasPrefix(arg, "--") {
 			p.positional = append(p.positional, arg)
 			continue
 		}
 		key := strings.TrimPrefix(arg, "--")
-		if bools[key] {
+		if boolFlags[key] {
 			p.flags[key] = true
 			continue
 		}
-		if !values[key] {
+		if !valueFlags[key] {
 			return p, gitworkspace.NewError("config_invalid", fmt.Sprintf("Unknown option --%s.", key))
 		}
 		if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
@@ -119,6 +151,9 @@ func parse(args []string) (parsedArgs, error) {
 		}
 		i++
 		p.values[key] = args[i]
+	}
+	if command != "rm" && p.flags["force"] {
+		return p, gitworkspace.NewError("config_invalid", "--force is supported only by gws rm. Use --into <branch> to choose a merge target.")
 	}
 	return p, nil
 }
@@ -130,69 +165,89 @@ func (p parsedArgs) optional(index int) string {
 	}
 	return p.positional[index]
 }
+
 func runNew(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
-	if p.value("project") != "" {
-		return gitworkspace.NewError("config_invalid", "gws new determines the Project from the current directory and does not accept --project.")
+	kind := gitworkspace.WorkspaceDev
+	if value := p.value("type"); value != "" {
+		switch gitworkspace.WorkspaceType(value) {
+		case gitworkspace.WorkspaceDev, gitworkspace.WorkspaceFix, gitworkspace.WorkspaceReview, gitworkspace.WorkspaceTest:
+			kind = gitworkspace.WorkspaceType(value)
+		default:
+			return gitworkspace.NewError("config_invalid", fmt.Sprintf("Unknown workspace type %q. Use dev, fix, review or test.", value))
+		}
 	}
-	workItem := p.optional(0)
-	if workItem == "" {
-		workItem = "workspace"
-	}
-	if _, _, err := app.InitProject(ctx, gitworkspace.InitRequest{CWD: cwd}); err != nil {
-		return err
-	}
-	initialCommitCreated, err := app.EnsureInitialCommit(ctx, cwd)
-	if err != nil {
-		return err
-	}
-	from := p.value("from")
-	workspace, err := app.CreateWorkspace(ctx, gitworkspace.CreateRequest{
-		ProjectSelector: p.value("project"),
-		CWD:             cwd,
-		Name:            p.value("name"),
-		Ref:             workItem,
-		FromRef:         from,
-		Type:            gitworkspace.WorkspaceDev,
-		New:             true,
-		FromCurrent:     from == "",
-		GenerateBranch:  true,
+	created, err := app.CreateWorkspace(ctx, gitworkspace.CreateRequest{
+		CWD:    cwd,
+		Name:   p.optional(0),
+		Base:   p.value("base"),
+		Type:   kind,
+		Detach: p.bool("detach"),
+		Fetch:  p.bool("fetch"),
 	})
 	if err != nil {
 		return err
 	}
+	baseDisplay := created.Source.BaseRef
+	baseCommit := created.Source.BaseCommit
+	if baseDisplay == "" {
+		baseDisplay = created.Source.FromRef
+	}
 	if p.bool("json") {
-		return writeJSON(s.out, "new", workspaceView(workspace), nil)
+		return writeJSON(s.out, "new", workspaceView(created), nil)
 	}
-	initialCommitLine := ""
-	if initialCommitCreated {
-		initialCommitLine = "Initial commit: created automatically (empty)\n"
+	fmt.Fprintf(s.out, "Created Workspace %s\nType: %s\nBased on: %s (%s)\nBranch: %s\nWorktree: %s\nTask: %s\n", created.ID, created.Type, displayValue(baseDisplay), shortSHA(baseCommit), created.Source.Ref, created.WorktreePath, created.TaskFilePath)
+	if !shouldEnter(p, s) {
+		fmt.Fprintf(s.out, "\nNext:\n  gws use %s\n", created.ID)
+		return nil
 	}
-	fmt.Fprintf(s.out, "Created Workspace %s\nWork item: %s\nFrom: %s\n%sManaged branch: %s\nWorktree: %s\n\nNext:\n  gws checkout %s\n", workspace.ID, workspace.Name, workspace.Source.FromRef, initialCommitLine, workspace.Source.Ref, workspace.WorktreePath, workspace.ID)
-	return nil
+	fmt.Fprintf(s.out, "\nEnterting Workspace %s. Exit the shell to return.\n", created.Name)
+	return app.LaunchShell(ctx, created, s.in, s.out, s.err)
 }
 
-func runCheckout(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
-	if p.bool("json") {
-		return gitworkspace.NewError("config_invalid", "checkout is interactive and does not support --json. Use path --json for platform integration.")
+func shouldEnter(p parsedArgs, s ioStreams) bool {
+	if p.bool("json") || p.bool("no-enter") {
+		return false
 	}
+	file, ok := s.out.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func shortSHA(value string) string {
+	if value == "" {
+		return "-"
+	}
+	if len(value) > 8 {
+		return value[:8]
+	}
+	return value
+}
+
+func runUse(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
 	selector := p.optional(0)
-	workspace, _, err := app.ResolveWorkspace(ctx, selector, p.value("project"), cwd, true)
+	workspace, err := app.ResolveWorkspace(ctx, selector, cwd, true)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(s.out, "Entering Workspace %s (%s)\nDirectory: %s\nExit the shell to return.\n", workspace.Name, workspace.ID, workspace.WorktreePath)
-	return app.LaunchCheckoutShell(ctx, workspace, s.in, s.out, s.err)
+	return app.LaunchShell(ctx, workspace, s.in, s.out, s.err)
 }
 
 func runApply(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
-	result, err := app.ApplyWorkspace(ctx, p.optional(0), p.value("project"), cwd)
+	if len(p.positional) > 0 {
+		return gitworkspace.NewError("config_invalid", "gws apply takes no Workspace argument. Run it from inside the Workspace, or use gws finish <workspace-id>.")
+	}
+	result, err := app.ApplyWorkspace(ctx, gitworkspace.ApplyRequest{CWD: cwd, Into: p.value("into")})
 	if err != nil {
 		return err
 	}
 	if p.bool("json") {
 		return writeJSON(s.out, "apply", applyView(result), nil)
 	}
-	fmt.Fprintf(s.out, "Applied Workspace %s (%s)\nSource: %s\nTarget: %s\nRepository: %s\n", result.Workspace.Name, result.Workspace.ID, result.SourceBranch, result.TargetBranch, result.Project.RepoPath)
+	fmt.Fprintf(s.out, "Applied Workspace %s (%s)\nSource: %s\nTarget: %s\nRepository: %s\n", result.Workspace.Name, result.Workspace.ID, result.SourceBranch, result.TargetBranch, result.RepoRoot)
 	return nil
 }
 
@@ -201,7 +256,7 @@ func runFinish(ctx context.Context, app *gitworkspace.App, cwd string, p parsedA
 	if selector == "" {
 		return gitworkspace.NewError("config_invalid", "Missing a Workspace argument. Usage: gws finish <workspace-id>. Run gws ls to list candidates.")
 	}
-	result, err := app.FinishWorkspace(ctx, selector, p.value("project"), cwd)
+	result, err := app.FinishWorkspace(ctx, selector, p.value("into"), cwd)
 	if err != nil {
 		return err
 	}
@@ -216,97 +271,8 @@ func runFinish(ctx context.Context, app *gitworkspace.App, cwd string, p parsedA
 	return nil
 }
 
-func runInit(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
-	project, updated, err := app.InitProject(ctx, gitworkspace.InitRequest{CWD: cwd, Name: p.value("name"), DefaultBranch: p.value("default-branch")})
-	if err != nil {
-		return err
-	}
-	if p.bool("json") {
-		return writeJSON(s.out, "init", initData{Project: projectView(project), Updated: updated}, nil)
-	}
-	action := "Already registered"
-	if updated {
-		action = "Registered"
-	}
-	fmt.Fprintf(s.out, "%s Project %s (%s)\nRepository: %s\n", action, project.Name, project.ID, project.RepoPath)
-	return nil
-}
-
-func runProject(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
-	sub := p.optional(0)
-	if sub == "" {
-		return gitworkspace.NewError("config_invalid", "Missing a project subcommand. Usage: gws project ls|show|rm.")
-	}
-	switch sub {
-	case "ls":
-		projects, err := app.Projects(ctx)
-		if err != nil {
-			return err
-		}
-		if p.bool("json") {
-			views := make([]projectJSON, len(projects))
-			for i, project := range projects {
-				views[i] = projectView(project)
-			}
-			return writeJSON(s.out, "project ls", projectsData{Projects: views}, nil)
-		}
-		w := tabwriter.NewWriter(s.out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tNAME\tREPOSITORY\tDEFAULT")
-		for _, v := range projects {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", v.ID, v.Name, v.RepoPath, v.DefaultBranch)
-		}
-		return w.Flush()
-	case "show":
-		selector := ""
-		if len(p.positional) > 1 {
-			selector = p.positional[1]
-		}
-		project, err := app.ResolveProject(ctx, selector, cwd)
-		if err != nil {
-			return err
-		}
-		if p.bool("json") {
-			return writeJSON(s.out, "project show", projectView(project), nil)
-		}
-		fmt.Fprintf(s.out, "Project: %s\nID: %s\nRepository: %s\nGit common dir: %s\nDefault branch: %s\nConfig: %s\n", project.Name, project.ID, project.RepoPath, project.GitCommonDir, project.DefaultBranch, project.ConfigPath)
-		return nil
-	case "rm":
-		selector := p.optional(1)
-		if selector == "" {
-			return gitworkspace.NewError("config_invalid", "Missing a Project argument. Usage: gws project rm <project-id>.")
-		}
-		if err := app.RemoveProject(ctx, selector); err != nil {
-			return err
-		}
-		if p.bool("json") {
-			return writeJSON(s.out, "project rm", removeData{Selector: selector, Removed: true}, nil)
-		}
-		fmt.Fprintf(s.out, "Removed Project registration %s. Original repository was not modified.\n", selector)
-		return nil
-	default:
-		return gitworkspace.NewError("config_invalid", fmt.Sprintf("Unknown project subcommand %q.", sub))
-	}
-}
-
-func runCreate(ctx context.Context, app *gitworkspace.App, cwd, command string, p parsedArgs, s ioStreams) error {
-	ref := p.optional(0)
-	if ref == "" {
-		return gitworkspace.NewError("config_invalid", fmt.Sprintf("Missing a branch argument. Usage: gws %s <branch>.", command))
-	}
-	kind := map[string]gitworkspace.WorkspaceType{"dev": gitworkspace.WorkspaceDev, "review": gitworkspace.WorkspaceReview, "fix": gitworkspace.WorkspaceFix, "test": gitworkspace.WorkspaceTest}[command]
-	workspace, err := app.CreateWorkspace(ctx, gitworkspace.CreateRequest{ProjectSelector: p.value("project"), CWD: cwd, Name: p.value("name"), Ref: ref, BaseRef: p.value("base"), FromRef: p.value("from"), Type: kind, New: p.bool("new"), Fetch: p.bool("fetch")})
-	if err != nil {
-		return err
-	}
-	if p.bool("json") {
-		return writeJSON(s.out, command, workspaceView(workspace), nil)
-	}
-	fmt.Fprintf(s.out, "Created Workspace %s\nWorktree: %s\nTask: %s\n\nNext:\n  gws checkout %s\n", workspace.ID, workspace.WorktreePath, workspace.TaskFilePath, workspace.ID)
-	return nil
-}
-
 func runList(ctx context.Context, app *gitworkspace.App, p parsedArgs, s ioStreams) error {
-	values, err := app.Workspaces(ctx, p.value("project"))
+	values, err := app.Workspaces(ctx)
 	if err != nil {
 		return err
 	}
@@ -317,33 +283,31 @@ func runList(ctx context.Context, app *gitworkspace.App, p parsedArgs, s ioStrea
 		fmt.Fprintln(s.out, "No Workspaces. Run gws new to create one.")
 		return nil
 	}
-	projects, _ := app.Projects(ctx)
-	projectsByID := map[string]gitworkspace.Project{}
-	for _, v := range projects {
-		projectsByID[v.ID] = v
-	}
 	w := tabwriter.NewWriter(s.out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tID\tREPOSITORY\tTYPE\tBRANCH\tFROM\tSTATUS")
+	fmt.Fprintln(w, "NAME\tID\tTYPE\tBRANCH\tBASE\tSTATUS")
 	for _, v := range values {
-		repository := v.ProjectID
-		if project, ok := projectsByID[v.ProjectID]; ok {
-			repository = project.Name
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", v.Name, v.ID, repository, v.Type, v.Source.Ref, displayValue(v.Source.FromRef), v.State)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", v.Name, v.ID, v.Type, v.Source.Ref, displayValue(baseRef(v)), v.State)
 	}
 	return w.Flush()
 }
 
+func baseRef(w gitworkspace.Workspace) string {
+	if w.Source.BaseRef != "" {
+		return w.Source.BaseRef
+	}
+	return w.Source.FromRef
+}
+
 func runShow(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
 	selector := p.optional(0)
-	workspace, project, err := app.ResolveWorkspace(ctx, selector, p.value("project"), cwd, true)
+	workspace, err := app.ResolveWorkspace(ctx, selector, cwd, true)
 	if err != nil {
 		return err
 	}
 	if p.bool("json") {
-		return writeJSON(s.out, "show", showData{Workspace: workspaceView(workspace), Project: projectView(project)}, nil)
+		return writeJSON(s.out, "show", showData{Workspace: workspaceView(workspace)}, nil)
 	}
-	fmt.Fprintf(s.out, "Workspace: %s\nID: %s\nRepository: %s\nRepository path: %s\nGit common dir: %s\nType: %s\nBranch: %s\nFrom: %s\nBase: %s\nManaged branch: %t\nStatus: %s\nWorktree: %s\nTask: %s\nCreated: %s\nUpdated: %s\n", workspace.Name, workspace.ID, project.Name, project.RepoPath, project.GitCommonDir, workspace.Type, workspace.Source.Ref, displayValue(workspace.Source.FromRef), displayValue(workspace.Source.BaseRef), workspace.Source.Managed, workspace.State, workspace.WorktreePath, workspace.TaskFilePath, workspace.CreatedAt.UTC().Format(time.RFC3339), workspace.UpdatedAt.UTC().Format(time.RFC3339))
+	fmt.Fprintf(s.out, "Workspace: %s\nID: %s\nRepository: %s\nGit common dir: %s\nType: %s\nBranch: %s\nBase: %s\nBase commit: %s\nManaged branch: %t\nStatus: %s\nWorktree: %s\nTask: %s\nCreated: %s\nUpdated: %s\n", workspace.Name, workspace.ID, app.Repo.Root, app.Repo.GitCommonDir, workspace.Type, workspace.Source.Ref, displayValue(baseRef(workspace)), displayValue(workspace.Source.BaseCommit), workspace.Source.Managed, workspace.State, workspace.WorktreePath, workspace.TaskFilePath, workspace.CreatedAt.UTC().Format(time.RFC3339), workspace.UpdatedAt.UTC().Format(time.RFC3339))
 	return nil
 }
 
@@ -356,7 +320,7 @@ func displayValue(value string) string {
 
 func runStatus(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
 	selector := p.optional(0)
-	status, err := app.Status(ctx, selector, p.value("project"), cwd)
+	status, err := app.Status(ctx, selector, cwd)
 	if err != nil {
 		return err
 	}
@@ -373,13 +337,82 @@ func runStatus(ctx context.Context, app *gitworkspace.App, cwd string, p parsedA
 			gitState = "dirty"
 		}
 	}
-	fmt.Fprintf(s.out, "Workspace: %s\nGit: %s\nWorktree registered: %t\nTask: %t\nState: %s\n", status.Workspace.ID, gitState, status.WorktreeRegistered, status.TaskExists, status.Workspace.State)
+	fmt.Fprintf(s.out, "Workspace: %s\nBase: %s (%s)\nGit: %s\nWorktree registered: %t\nTask: %t\nState: %s\n", status.Workspace.ID, displayValue(baseRef(status.Workspace)), shortSHA(status.Workspace.Source.BaseCommit), gitState, status.WorktreeRegistered, status.TaskExists, status.Workspace.State)
+	return nil
+}
+
+func runDiff(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
+	result, err := app.DiffWorkspace(ctx, p.optional(0), cwd, p.bool("staged"), p.bool("stat"), p.bool("uncommitted"))
+	if err != nil {
+		return err
+	}
+	if p.bool("json") {
+		return writeJSON(s.out, "diff", diffData{WorkspaceID: result.Workspace.ID, Base: result.Base, Content: result.Content, Untracked: result.Untracked}, nil)
+	}
+	if strings.TrimSpace(result.Content) == "" && len(result.Untracked) == 0 {
+		fmt.Fprintf(s.out, "No changes relative to %s.\n", shortSHA(result.Base))
+		return nil
+	}
+	if strings.TrimSpace(result.Content) != "" {
+		fmt.Fprint(s.out, result.Content)
+		if !strings.HasSuffix(result.Content, "\n") {
+			fmt.Fprintln(s.out)
+		}
+	}
+	if len(result.Untracked) > 0 {
+		fmt.Fprintf(s.out, "\nUntracked files (not in the diff, stage them with git add):\n")
+		for _, file := range result.Untracked {
+			fmt.Fprintf(s.out, "  %s\n", file)
+		}
+	}
+	return nil
+}
+
+func runLog(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
+	limit := 0
+	if value := p.value("limit"); value != "" {
+		parsedLimit, err := strconv.Atoi(value)
+		if err != nil || parsedLimit <= 0 {
+			return gitworkspace.NewError("config_invalid", fmt.Sprintf("Invalid --limit value %q. Use a positive integer.", value))
+		}
+		limit = parsedLimit
+	}
+	result, err := app.LogWorkspace(ctx, p.optional(0), cwd, limit, p.bool("stat"))
+	if err != nil {
+		return err
+	}
+	if p.bool("json") {
+		return writeJSON(s.out, "log", logData{WorkspaceID: result.Workspace.ID, Base: result.Base, Content: result.Content}, nil)
+	}
+	if strings.TrimSpace(result.Content) == "" {
+		fmt.Fprintf(s.out, "No commits since %s.\n", shortSHA(result.Base))
+		return nil
+	}
+	fmt.Fprint(s.out, result.Content)
+	if !strings.HasSuffix(result.Content, "\n") {
+		fmt.Fprintln(s.out)
+	}
+	return nil
+}
+
+func runCommit(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
+	if len(p.positional) > 0 {
+		return gitworkspace.NewError("config_invalid", "gws commit takes no positional arguments. Run it from inside the Workspace; message goes to --message.")
+	}
+	result, err := app.CommitWorkspace(ctx, cwd, p.value("message"), p.bool("all"))
+	if err != nil {
+		return err
+	}
+	if p.bool("json") {
+		return writeJSON(s.out, "commit", commitData{WorkspaceID: result.Workspace.ID, Branch: result.Workspace.Source.Ref, Commit: result.Commit, Subject: result.Subject}, nil)
+	}
+	fmt.Fprintf(s.out, "Committed %s to Workspace %s (%s)\nBranch: %s\nSubject: %s\n", shortSHA(result.Commit), result.Workspace.Name, result.Workspace.ID, result.Workspace.Source.Ref, result.Subject)
 	return nil
 }
 
 func runPath(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
 	selector := p.optional(0)
-	w, _, err := app.ResolveWorkspace(ctx, selector, p.value("project"), cwd, true)
+	w, err := app.ResolveWorkspace(ctx, selector, cwd, true)
 	if err != nil {
 		return err
 	}
@@ -394,7 +427,7 @@ func runRemove(ctx context.Context, app *gitworkspace.App, cwd string, p parsedA
 	if selector == "" {
 		return gitworkspace.NewError("config_invalid", "Missing a Workspace argument. Usage: gws rm <workspace-id>. Run gws ls to list candidates.")
 	}
-	if err := app.RemoveWorkspace(ctx, selector, p.value("project"), cwd, p.bool("force")); err != nil {
+	if err := app.RemoveWorkspace(ctx, selector, cwd, p.bool("force")); err != nil {
 		return err
 	}
 	if p.bool("json") {
@@ -425,8 +458,8 @@ func runGC(ctx context.Context, app *gitworkspace.App, p parsedArgs, s ioStreams
 	return nil
 }
 
-func runDoctor(ctx context.Context, app *gitworkspace.App, cwd string, p parsedArgs, s ioStreams) error {
-	checks, err := app.Doctor(ctx, p.value("project"), cwd)
+func runDoctor(ctx context.Context, app *gitworkspace.App, p parsedArgs, s ioStreams) error {
+	checks, err := app.Doctor(ctx)
 	if err != nil {
 		return err
 	}
@@ -438,7 +471,7 @@ func runDoctor(ctx context.Context, app *gitworkspace.App, cwd string, p parsedA
 	}
 	if p.bool("json") {
 		if hasError {
-			return gitworkspace.NewError("doctor_failed", "Doctor found invalid project configuration.")
+			return gitworkspace.NewError("doctor_failed", "Doctor found invalid repository configuration.")
 		}
 		return writeJSON(s.out, "doctor", doctorData{Checks: checks}, nil)
 	}
@@ -453,24 +486,24 @@ func runDoctor(ctx context.Context, app *gitworkspace.App, cwd string, p parsedA
 		fmt.Fprintf(s.out, "%s %s: %s\n", mark, c.Name, c.Message)
 	}
 	if hasError {
-		return gitworkspace.NewError("doctor_failed", "Doctor found invalid project configuration.")
+		return gitworkspace.NewError("doctor_failed", "Doctor found invalid repository configuration.")
 	}
 	return nil
 }
 
 func runCapabilities(p parsedArgs, s ioStreams) error {
 	data := capabilitiesData{
-		ProtocolVersion: 1,
+		ProtocolVersion: 2,
 		StateVersion:    gitworkspace.CurrentStateVersion,
 		Backend:         "git-worktree",
-		Features:        []string{"project-registry", "work-item", "managed-branch", "safe-cleanup", "apply", "finish", "json"},
-		Interactive:     []string{"checkout"},
+		Features:        []string{"work-item", "managed-branch", "safe-cleanup", "apply", "finish", "diff", "log", "commit", "json"},
+		Interactive:     []string{"use", "new"},
 	}
 	if p.bool("json") {
 		return writeJSON(s.out, "capabilities", data, nil)
 	}
 	fmt.Fprintln(s.out, "Backend: git-worktree")
-	fmt.Fprintln(s.out, "Plugin protocol: 1")
+	fmt.Fprintln(s.out, "Plugin protocol: 2")
 	fmt.Fprintf(s.out, "State format: %d\n", gitworkspace.CurrentStateVersion)
 	fmt.Fprintln(s.out, "Machine interface: add --json to non-interactive commands")
 	return nil
@@ -500,17 +533,17 @@ func writeJSON(out io.Writer, command string, data any, err error) error {
 }
 
 type sourceJSON struct {
-	Kind     string  `json:"kind"`
-	Ref      string  `json:"ref"`
-	BaseRef  *string `json:"base_ref"`
-	Detached bool    `json:"detached"`
-	New      bool    `json:"new"`
-	Managed  bool    `json:"managed"`
-	FromRef  *string `json:"from_ref"`
+	Kind       string  `json:"kind"`
+	Ref        string  `json:"ref"`
+	BaseRef    *string `json:"base_ref"`
+	BaseCommit *string `json:"base_commit"`
+	Detached   bool    `json:"detached"`
+	New        bool    `json:"new"`
+	Managed    bool    `json:"managed"`
+	FromRef    *string `json:"from_ref"`
 }
 type workspaceJSON struct {
 	ID           string                      `json:"id"`
-	ProjectID    string                      `json:"project_id"`
 	Name         string                      `json:"name"`
 	Type         gitworkspace.WorkspaceType  `json:"type"`
 	Source       sourceJSON                  `json:"source"`
@@ -530,7 +563,11 @@ func pointer(value string) *string {
 	return &v
 }
 func workspaceView(w gitworkspace.Workspace) workspaceJSON {
-	return workspaceJSON{ID: w.ID, ProjectID: w.ProjectID, Name: w.Name, Type: w.Type, Source: sourceJSON{Kind: w.Source.Kind, Ref: w.Source.Ref, BaseRef: pointer(w.Source.BaseRef), Detached: w.Source.Detached, New: w.Source.New, Managed: w.Source.Managed, FromRef: pointer(w.Source.FromRef)}, WorktreePath: w.WorktreePath, TaskFilePath: w.TaskFilePath, State: w.State, LastError: pointer(w.LastError), CreatedAt: w.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: w.UpdatedAt.UTC().Format(time.RFC3339)}
+	base := w.Source.BaseRef
+	if base == "" {
+		base = w.Source.FromRef
+	}
+	return workspaceJSON{ID: w.ID, Name: w.Name, Type: w.Type, Source: sourceJSON{Kind: w.Source.Kind, Ref: w.Source.Ref, BaseRef: pointer(base), BaseCommit: pointer(w.Source.BaseCommit), Detached: w.Source.Detached, New: w.Source.New, Managed: w.Source.Managed, FromRef: pointer(w.Source.FromRef)}, WorktreePath: w.WorktreePath, TaskFilePath: w.TaskFilePath, State: w.State, LastError: pointer(w.LastError), CreatedAt: w.CreatedAt.UTC().Format(time.RFC3339), UpdatedAt: w.UpdatedAt.UTC().Format(time.RFC3339)}
 }
 func workspaceViews(values []gitworkspace.Workspace) []workspaceJSON {
 	result := make([]workspaceJSON, len(values))
@@ -538,9 +575,6 @@ func workspaceViews(values []gitworkspace.Workspace) []workspaceJSON {
 		result[i] = workspaceView(v)
 	}
 	sort.Slice(result, func(i, j int) bool {
-		if result[i].ProjectID != result[j].ProjectID {
-			return result[i].ProjectID < result[j].ProjectID
-		}
 		if result[i].Name != result[j].Name {
 			return result[i].Name < result[j].Name
 		}
@@ -549,33 +583,13 @@ func workspaceViews(values []gitworkspace.Workspace) []workspaceJSON {
 	return result
 }
 
-type projectJSON struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	RepoPath      string `json:"repo_path"`
-	GitCommonDir  string `json:"git_common_dir"`
-	DefaultBranch string `json:"default_branch"`
-	ConfigPath    string `json:"config_path"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
-}
-
 type listData struct {
 	Workspaces []workspaceJSON `json:"workspaces"`
 }
 
-type initData struct {
-	Project projectJSON `json:"project"`
-	Updated bool        `json:"updated"`
-}
-
-type projectsData struct {
-	Projects []projectJSON `json:"projects"`
-}
-
 type applyData struct {
 	Workspace    workspaceJSON `json:"workspace"`
-	Project      projectJSON   `json:"project"`
+	RepoRoot     string        `json:"repo_root"`
 	SourceBranch string        `json:"source_branch"`
 	TargetBranch string        `json:"target_branch"`
 }
@@ -583,6 +597,26 @@ type applyData struct {
 type pathData struct {
 	WorkspaceID string `json:"workspace_id"`
 	Path        string `json:"path"`
+}
+
+type diffData struct {
+	WorkspaceID string   `json:"workspace_id"`
+	Base        string   `json:"base"`
+	Content     string   `json:"content"`
+	Untracked   []string `json:"untracked_files"`
+}
+
+type logData struct {
+	WorkspaceID string `json:"workspace_id"`
+	Base        string `json:"base"`
+	Content     string `json:"content"`
+}
+
+type commitData struct {
+	WorkspaceID string `json:"workspace_id"`
+	Branch      string `json:"branch"`
+	Commit      string `json:"commit"`
+	Subject     string `json:"subject"`
 }
 
 type removeData struct {
@@ -609,7 +643,6 @@ type capabilitiesData struct {
 
 type showData struct {
 	Workspace workspaceJSON `json:"workspace"`
-	Project   projectJSON   `json:"project"`
 }
 
 type gitStatusJSON struct {
@@ -629,16 +662,13 @@ type statusData struct {
 	Task      taskStatusJSON `json:"task"`
 }
 
-func projectView(p gitworkspace.Project) projectJSON {
-	return projectJSON{p.ID, p.Name, p.RepoPath, p.GitCommonDir, p.DefaultBranch, p.ConfigPath, p.CreatedAt.UTC().Format(time.RFC3339), p.UpdatedAt.UTC().Format(time.RFC3339)}
-}
 func applyView(v gitworkspace.ApplyResult) applyData {
-	return applyData{Workspace: workspaceView(v.Workspace), Project: projectView(v.Project), SourceBranch: v.SourceBranch, TargetBranch: v.TargetBranch}
+	return applyData{Workspace: workspaceView(v.Workspace), RepoRoot: v.RepoRoot, SourceBranch: v.SourceBranch, TargetBranch: v.TargetBranch}
 }
 func statusView(v gitworkspace.Status) statusData {
 	return statusData{
 		Workspace: workspaceView(v.Workspace),
-		Git:       gitStatusJSON{RepoExists: v.RepoExists, WorktreeExists: v.WorktreeExists, WorktreeRegistered: v.WorktreeRegistered, Dirty: v.Dirty},
+		Git:       gitStatusJSON{RepoExists: v.RepoRoot != "", WorktreeExists: v.WorktreeExists, WorktreeRegistered: v.WorktreeRegistered, Dirty: v.Dirty},
 		Task:      taskStatusJSON{Exists: v.TaskExists},
 	}
 }
@@ -677,26 +707,32 @@ func supportsColor(out io.Writer) bool {
 }
 
 func printHelp(out io.Writer) {
-	fmt.Fprint(out, `Git Workspace manages task-oriented Git worktrees and their lifecycle.
+	fmt.Fprint(out, `Git Workspace creates isolated worktrees from the branch you are on and merges them back safely.
 
 Usage:
-  gws init [--name NAME] [--default-branch BRANCH]
-  gws new [NAME] [--from REF]
-  gws checkout [WORKSPACE]
-  gws apply [WORKSPACE] [--project PROJECT]
-  gws finish WORKSPACE [--project PROJECT]
-  gws ls [--project PROJECT] [--json]
-  gws show|status|path [WORKSPACE] [--project PROJECT]
-  gws rm WORKSPACE [--project PROJECT] [--force]
-  gws project ls|show|rm
+  gws new [NAME] [--base BRANCH|SHA] [--type dev|fix|review|test] [--detach] [--fetch] [--no-enter] [--json]
+  gws use [WORKSPACE]
+  gws apply [--into BRANCH]
+  gws finish WORKSPACE [--into BRANCH]
+  gws diff [WORKSPACE] [--staged] [--stat] [--uncommitted] [--json]
+  gws log [WORKSPACE] [--limit N] [--stat] [--json]
+  gws commit --message MESSAGE [--all] [--json]
+  gws ls [--json]
+  gws show|status|path [WORKSPACE]
+  gws rm WORKSPACE [--force]
   gws gc [--dry-run]
-  gws doctor [--project PROJECT]
+  gws doctor
   gws capabilities [--json]
 
-Machine interface:
-  Add --json to non-interactive commands. checkout is always interactive.
+Workflow:
+  gws new                 create a Workspace based on the current branch and enter it
+  gws use <id>            enter an existing Workspace
+  gws commit -m ...       commit inside the Workspace (--all includes tracked changes)
+  gws diff                show everything this Workspace changed since its base
+  gws apply               merge the Workspace back into its base branch (run inside the Workspace)
+  gws finish <id>         merge back and clean up (run outside the Workspace)
 
-Advanced workspace types:
-  gws dev|review|fix|test BRANCH [options]
+Machine interface:
+  Add --json to non-interactive commands. use is always interactive; new enters a shell unless --json/--no-enter is set.
 `)
 }

@@ -86,32 +86,6 @@ func listJSON[T any](dir string) ([]T, error) {
 	return values, nil
 }
 
-func (s Store) SaveProject(value Project) error {
-	value.StateVersion = CurrentStateVersion
-	return atomicJSON(s.Paths.ProjectFile(value.ID), value)
-}
-func (s Store) Project(id string) (Project, error) {
-	value, err := readJSON[Project](s.Paths.ProjectFile(id))
-	if err != nil {
-		return Project{}, err
-	}
-	return normalizeProjectState(value)
-}
-func (s Store) Projects() ([]Project, error) {
-	values, err := listJSON[Project](s.Paths.ProjectsDir())
-	if err != nil {
-		return nil, err
-	}
-	for i := range values {
-		values[i], err = normalizeProjectState(values[i])
-		if err != nil {
-			return nil, err
-		}
-	}
-	sort.Slice(values, func(i, j int) bool { return values[i].ID < values[j].ID })
-	return values, nil
-}
-func (s Store) DeleteProject(id string) error { return removeIfExists(s.Paths.ProjectFile(id)) }
 func (s Store) SaveWorkspace(value Workspace) error {
 	value.StateVersion = CurrentStateVersion
 	return atomicJSON(s.Paths.WorkspaceFile(value.ID), value)
@@ -135,9 +109,6 @@ func (s Store) Workspaces() ([]Workspace, error) {
 		}
 	}
 	sort.Slice(values, func(i, j int) bool {
-		if values[i].ProjectID != values[j].ProjectID {
-			return values[i].ProjectID < values[j].ProjectID
-		}
 		if values[i].Name != values[j].Name {
 			return values[i].Name < values[j].Name
 		}
@@ -153,16 +124,6 @@ func removeIfExists(path string) error {
 		return nil
 	}
 	return err
-}
-
-func normalizeProjectState(value Project) (Project, error) {
-	if value.StateVersion == 0 {
-		value.StateVersion = CurrentStateVersion
-	}
-	if value.StateVersion != CurrentStateVersion {
-		return Project{}, NewError("state_version_unsupported", fmt.Sprintf("Project %q uses unsupported state version %d; this gws release supports version %d.", value.ID, value.StateVersion, CurrentStateVersion))
-	}
-	return value, nil
 }
 
 func normalizeWorkspaceState(value Workspace) (Workspace, error) {

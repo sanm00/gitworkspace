@@ -6,8 +6,11 @@ import (
 	"strings"
 )
 
-func RenderTask(project Project, workspace Workspace) string {
-	typeName := strings.ToUpper(string(workspace.Type[:1])) + string(workspace.Type[1:])
+func RenderTask(workspace Workspace) string {
+	typeName := string(workspace.Type)
+	if len(typeName) > 0 {
+		typeName = strings.ToUpper(typeName[:1]) + typeName[1:]
+	}
 	permission := "You may modify project files to complete this task."
 	focus := "Implement the requested change, run relevant tests, and report the result."
 	if workspace.Type == WorkspaceReview {
@@ -17,11 +20,15 @@ func RenderTask(project Project, workspace Workspace) string {
 		permission = "Do not modify project files unless explicitly requested by the developer."
 		focus = "Validate the target, run relevant tests, and report failures with reproducible details."
 	}
-	base := workspace.Source.BaseRef
+	base := firstNonEmpty(workspace.Source.BaseRef, workspace.Source.FromRef)
 	if base == "" {
 		base = "(none)"
 	}
-	return fmt.Sprintf("# Git Workspace Task\n\nType: %s\nProject: %s\nWorkspace: %s\nTarget: %s\nBase: %s\nWorktree: %s\n\n## Instructions\n\n%s\n%s\n", typeName, project.Name, workspace.Name, workspace.Source.Ref, base, workspace.WorktreePath, focus, permission)
+	baseCommit := workspace.Source.BaseCommit
+	if baseCommit == "" {
+		baseCommit = "-"
+	}
+	return fmt.Sprintf("# Git Workspace Task\n\nType: %s\nWorkspace: %s\nTarget: %s\nBase: %s\nBase commit: %s\nWorktree: %s\n\n## Instructions\n\n%s\n%s\n", typeName, workspace.Name, workspace.Source.Ref, base, baseCommit, workspace.WorktreePath, focus, permission)
 }
 
 func WriteTask(path, content string) error {

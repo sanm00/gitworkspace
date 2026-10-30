@@ -51,6 +51,42 @@ func (g Git) DetectRepository(ctx context.Context, path string) (Repository, err
 	return Repository{Root: root, GitCommonDir: common, CurrentBranch: branch}, nil
 }
 
+func (g Git) ResolveCommit(ctx context.Context, repoPath, ref string) (string, error) {
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", repoPath, "rev-parse", "--verify", "--quiet", ref + "^{commit}"}})
+	if err != nil {
+		return "", NewError("git_ref_not_found", fmt.Sprintf("Git ref %q does not exist.", ref))
+	}
+	commit := strings.TrimSpace(result.Stdout)
+	if commit == "" {
+		return "", NewError("git_ref_not_found", fmt.Sprintf("Git ref %q does not resolve to a commit.", ref))
+	}
+	return commit, nil
+}
+
+func (g Git) IsBranch(ctx context.Context, repoPath, ref string) bool {
+	if ref == "" || strings.Contains(ref, "^") || strings.Contains(ref, "~") {
+		return false
+	}
+	_, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", repoPath, "show-ref", "--verify", "--quiet", "refs/heads/" + ref}})
+	return err == nil
+}
+
+func (g Git) MainWorktree(ctx context.Context, repoPath string) (string, error) {
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", repoPath, "worktree", "list", "--porcelain"}})
+	if err != nil {
+		return "", WrapError("external_command_failed", "Failed to list Git worktrees.", err)
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if rest, ok := strings.CutPrefix(line, "worktree "); ok {
+			path := strings.TrimSpace(rest)
+			if path != "" {
+				return canonical(path)
+			}
+		}
+	}
+	return "", NewError("internal_error", "Git worktree list returned no entries.")
+}
+
 func (g Git) RefExists(ctx context.Context, repoPath, ref string) bool {
 	_, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", repoPath, "rev-parse", "--verify", "--quiet", ref + "^{commit}"}})
 	return err == nil
@@ -121,6 +157,79 @@ func (g Git) Merge(ctx context.Context, repoPath, ref string) error {
 		return WrapError("merge_failed", fmt.Sprintf("Failed to merge %q. The target repository may contain conflicts; resolve them or run git merge --abort.", ref), err)
 	}
 	return nil
+}
+
+func (g Git) Diff(ctx context.Context, path, base string, staged, stat bool) (string, error) {
+	args := []string{"-C", path, "diff", "--no-color"}
+	if staged {
+		args = append(args, "--staged")
+	}
+	if stat {
+		args = append(args, "--stat")
+	}
+	if base != "" {
+		args = append(args, base)
+	}
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: args})
+	if err != nil {
+		return "", WrapError("external_command_failed", "Failed to compute the Workspace diff.", err)
+	}
+	return result.Stdout, nil
+}
+
+func (g Git) UntrackedFiles(ctx context.Context, path string) ([]string, error) {
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", path, "ls-files", "--others", "--exclude-standard"}})
+	if err != nil {
+		return nil, WrapError("external_command_failed", "Failed to list untracked Workspace files.", err)
+	}
+	files := []string{}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if file := strings.TrimSpace(line); file != "" {
+			files = append(files, file)
+		}
+	}
+	return files, nil
+}
+
+func (g Git) Log(ctx context.Context, path, base string, limit int, stat bool) (string, error) {
+	args := []string{"-C", path, "log", "--no-color", "--oneline"}
+	if stat {
+		args = append(args, "--stat")
+	}
+	if limit > 0 {
+		args = append(args, "--max-count", fmt.Sprintf("%d", limit))
+	}
+	args = append(args, base+"..HEAD")
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: args})
+	if err != nil {
+		return "", WrapError("external_command_failed", "Failed to list Workspace commits.", err)
+	}
+	return result.Stdout, nil
+}
+
+func (g Git) Commit(ctx context.Context, path, message string, all bool) error {
+	args := []string{"-C", path, "commit", "-m", message}
+	if all {
+		args = append(args, "--all")
+	}
+	if _, err := g.Runner.Run(ctx, Command{Path: "git", Args: args}); err != nil {
+		return WrapError("commit_failed", "Failed to commit the Workspace. Stage untracked files with git add first; --all only includes tracked files.", err)
+	}
+	return nil
+}
+
+func (g Git) HeadSummary(ctx context.Context, path string) (string, string, error) {
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", path, "log", "-1", "--pretty=%H%x1f%s"}})
+	if err != nil {
+		return "", "", WrapError("external_command_failed", "Failed to read the committed HEAD.", err)
+	}
+	parts := strings.SplitN(strings.TrimRight(result.Stdout, "\n"), "\x1f", 2)
+	commit := parts[0]
+	subject := ""
+	if len(parts) > 1 {
+		subject = parts[1]
+	}
+	return commit, subject, nil
 }
 
 func (g Git) DeleteBranch(ctx context.Context, repoPath, ref string, force bool) error {

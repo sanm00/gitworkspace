@@ -6,9 +6,7 @@
 
 [English](README.md)
 
-Git Workspace 是一个具有明确工作项模型、自动分支策略、安全清理和成果应用流程的 Git worktree 管理器。
-
-它既可以独立使用，也可以作为更大的开发环境隔离平台中的“源码工作空间插件”。
+Git Workspace（`gws`）用于从你当前所在的分支切出隔离的 worktree，并在确认安全后合并回去。它为两个时刻而生：一边继续开发、一边排查问题；以及在同一仓库里并行推进多件事。
 
 > **项目状态：** 当前处于 1.0 之前。项目会谨慎维护 CLI 和 JSON 兼容性，但仍可能在附带迁移说明的版本中引入不兼容调整。
 
@@ -17,16 +15,12 @@ Git Workspace 是一个具有明确工作项模型、自动分支策略、安全
 Git Workspace 只负责源码工作空间的生命周期：
 
 ```text
-工作项 -> 托管分支 -> Git worktree -> apply 或 finish
+基线分支 -> 托管分支（gws/<name>）-> Git worktree -> apply 或 finish
 ```
 
-Git Workspace 不启动编程智能体、编辑器、容器、数据库、宿主机进程或网络服务。上层平台可以解析托管 Workspace，再围绕其 worktree 路径配置这些资源。
-
-文件隔离能力来自 Git worktree。Git Workspace 增加命名、元数据、并发锁、失败回滚、所有权检查、诊断和生命周期策略，但不宣称提供进程、端口、依赖、凭据或运行时隔离。
+它不启动编程智能体、编辑器、容器、数据库、宿主机进程或网络服务。文件隔离能力来自 Git worktree；`gws` 在此基础上增加命名、基线记录、并发锁、失败回滚、所有权检查、诊断和生命周期策略。
 
 ## 安装
-
-使用 Go 安装最新标签版本：
 
 ```bash
 go install github.com/sanm00/gitworkspace/cmd/gws@latest
@@ -54,110 +48,141 @@ make build VERSION=v0.1.0-test
 
 ## 快速开始
 
-按需初始化 Git，并将当前目录注册为 Project：
+你正在 `feature-x` 上开发，需要同一基线的第二份隔离副本——排查一个 bug，或者在不打扰当前工作的情况下尝试改动：
 
 ```bash
 cd ~/projects/example
-gws init --name example --default-branch main
+git checkout feature-x
+gws new
 ```
 
-`init` 始终把当前目录作为 Project 根目录。如果当前目录本身还不是 Git 仓库根目录，就先在这里执行 `git init`；即使当前目录位于父 Git 仓库内也是如此。通过配置或命令行显式指定的默认分支会作为初始分支。
+`gws new` 不需要任何参数。它以当前分支为基线创建 Workspace，在该 commit 上建立托管分支 `gws/<name>`，在同级目录（`../example-gws/<id>/`）开出 worktree，把元数据写入 `.git/gws/`，然后直接进入其中的子 Shell。用完 `exit` 退出。
 
-从当前分支创建 Workspace 并进入子 Shell。工作项名称可以省略：
+每条命令都会报告所用的基线：
+
+```text
+Created Workspace feature-x-9f2c
+Type: dev
+Based on: feature-x (1a2b3c4d)
+Branch: gws/feature-x
+Worktree: /Users/you/projects/example-gws/feature-x-9f2c
+```
+
+之后要再进入这个 Workspace：
 
 ```bash
-gws new feature/avatar
-gws checkout feature-avatar
+gws use feature-x-9f2c     # 支持 ID、无歧义前缀或名称
 ```
 
-直接执行 `gws new` 时使用 `workspace` 作为自动生成的标签；随机化的 Workspace ID 和托管分支仍保持唯一。
-
-`new` 会创建全局唯一的 Git Workspace 托管分支。工作项名称仅是可选的易读标签，不是 Git 分支名，因此仓库中已经存在 `feature/avatar` 分支也不会冲突。
-
-同一个工作项名称可以创建多个 Workspace；名称产生歧义时使用命令输出的 Workspace ID。
-
-`new` 始终把当前目录作为项目根目录，不接受 `--project`；当前目录尚未成为 Git 仓库或尚未注册时会自动完成初始化和注册。仓库没有 commit 时，`new` 会自动创建一个空的首次提交，并且不会提交或清空当前暂存区内容。需要从当前分支以外的 ref 创建时，使用 `--from REF`。
-
-在 Workspace 中提交修改，然后选择成果处理方式：
+在 Workspace 内照常提交修改，然后把成果合回去：
 
 ```bash
-gws apply
+gws apply                  # 合并进基线分支，保留 Workspace
 ```
 
-`apply` 将 Workspace 中已提交的分支合并到注册原始仓库当前所在分支，并保留 Workspace。未指定 Workspace 时，优先使用包含当前目录的 Workspace；否则只在当前 Project 中选择唯一可应用的 Workspace。存在多个候选时返回错误并列出它们的 ID。
+`apply` 必须在 Workspace 内执行，默认目标是它的基线分支（可用 `--into <branch>` 覆盖）。合并前它会逐项校验前置条件——工作区干净、主检出正处于目标分支、无冲突——任一不满足就停下并给出可操作的原因，不做任何半截操作：
+
+```text
+! 主检出目录 … 当前在 "main" 分支，不是目标 "feature-x"。
+  请执行 git -C … checkout feature-x，或使用 --into main 合并到其他分支。
+```
+
+彻底收尾时回到主检出目录执行：
 
 ```bash
-exit
-gws finish feature-avatar
+gws finish feature-x-9f2c  # 合并后删除 worktree 与托管分支
 ```
 
-`finish` 先应用成果，只有合并成功后才删除 worktree 和托管分支。
+`finish` 先应用成果，只有合并成功才执行清理。
+
+## 其他工作空间类型
+
+```bash
+gws new --base pull/123/head --type review   # detached，只读检查
+gws new --base v0.9.0 --type test            # detached，针对标签复现问题
+gws new hotfix --base main --type fix        # 与 dev 相同，基于 main 的托管分支
+```
+
+`review` 和 `test` 的 worktree 是 detached 的：它们无法 apply，这正是只读排查的安全保证。`--fetch` 会先刷新远程引用，且仅允许与这两种类型搭配使用。
+
+## 常用 Git 操作封装
+
+`gws` 也把空间里最常敲的 Git 命令封装好了，不必再记基线 commit、也不用重复拼路径：
+
+```bash
+gws commit -m "修复头像上传" -a    # 在空间内提交
+gws diff                          # 本空间相对基线改了什么
+gws diff --uncommitted            # 只看还没提交的部分
+gws diff --staged --stat          # 已暂存改动的摘要
+gws log -n 5                      # 基线之上的提交
+```
+
+`gws diff` 输出的就是普通 `git diff` 内容，并把未跟踪文件单独列出（Git 的 diff 从不包含它们）。`gws commit` 拒绝 detached 的 review/test 空间——它们按设计是只读的。
 
 ## 核心命令
 
 ```text
-gws init
-gws new
-gws checkout
-gws apply
-gws finish
-gws ls|show|status|path
-gws rm
-gws project ls|show|rm
-gws gc
+gws new [NAME] [--base BRANCH|SHA] [--type dev|fix|review|test] [--detach] [--fetch] [--no-enter] [--json]
+gws use [WORKSPACE]
+gws commit --message MESSAGE [-a] [--json]
+gws diff [WORKSPACE] [--staged] [--stat] [--uncommitted] [--json]
+gws log [WORKSPACE] [-n N] [--stat] [--json]
+gws apply [--into BRANCH]
+gws finish WORKSPACE [--into BRANCH]
+gws ls | show | status | path [WORKSPACE]
+gws rm WORKSPACE [--force]
+gws gc [--dry-run]
 gws doctor
-gws capabilities
+gws capabilities [--json]
 ```
 
-高级命令 `dev`、`review`、`fix`、`test` 用于接入显式分支或创建 detached 检查工作空间。
+`--help`、`--version`、`capabilities` 在任何目录都可用；其余命令必须在 Git 仓库内执行。
 
 ## 安全模型
 
 - 状态变更由跨进程锁串行化；
 - 创建时先记录 `creating` 状态，失败时回滚部分资源；
-- 普通删除拒绝包含未提交修改的 worktree；
-- `gws rm` 默认只能删除当前仓库的 Workspace，显式提供 `--project` 时才可选择其他仓库；
-- `--force` 只跳过 dirty 检查，不跳过路径所有权检查；
-- `apply` 失败时，`finish` 不执行清理；
-- 只有明确标记为 Git Workspace 托管的分支才会自动删除；
-- `gc --dry-run` 可预览回收动作。
+- 托管分支位于 `gws/` 命名空间并带有所有权标记，只有被标记托管的分支才会自动删除；
+- `apply`/`finish` 先行全量前置校验并报告阻塞原因，不会半应用；合并失败时 `finish` 不执行清理；
+- 普通删除拒绝包含未提交修改的 worktree；`--force` 只跳过 dirty 检查，不跳过路径所有权检查；
+- `gc` 清理 worktree 已消失的元数据，但从不删除用户分支。
 
 ## 平台插件接口
 
-插件边界是 `gws` 子进程。平台应先发现能力，而不是假定功能：
+所有非交互命令都支持 `--json`，输出带版本号的信封结构（schema 版本 2，协议版本 2）：
 
 ```bash
-gws capabilities --json
-```
-
-所有非交互生命周期和查询命令都支持 `--json`，并输出带版本号的信封结构：
-
-```bash
-gws new issue-328 --json
+gws new issue-328 --no-enter --json
 gws show issue-328 --json
 gws path issue-328 --json
 gws finish issue-328 --json
 ```
 
-`checkout` 是面向人的交互命令，故意不支持 JSON。上层平台应调用 `path --json` 获取工作目录，再自行启动运行时。具体契约见 [GIT_WORKSPACE_IMPLEMENTATION_SPEC.zh.md](GIT_WORKSPACE_IMPLEMENTATION_SPEC.zh.md)。
+`use` 是面向人的交互命令，故意不支持 JSON。上层平台应调用 `path --json` 获取工作目录，再自行启动运行时。携带 `--json`（或标准输出不是终端）时，`new` 只创建、不进入子 Shell。具体契约见 [GIT_WORKSPACE_IMPLEMENTATION_SPEC.zh.md](GIT_WORKSPACE_IMPLEMENTATION_SPEC.zh.md)。
 
 `internal/` 下的包不是公共 Go API。受支持的集成入口是带版本的 `gws --json` 子进程协议。
 
 ## 配置与状态
 
-仓库可选配置文件为 `.git-workspace.yaml`：
+`gws` 持久化的一切都在仓库内部：
 
-```yaml
-version: 1
-
-project:
-  name: example
-  default_branch: main
+```text
+<repo>/.git/gws/config.json          可选配置
+<repo>/.git/gws/workspaces/<id>.json Workspace 元数据
+<repo>/.git/gws/tasks/<id>.md        供编程智能体使用的任务说明
+<repo>/.git/gws/locks/state.lock     跨进程锁
+<parent>/<repo>-gws/<id>/            worktree 检出目录
 ```
 
-该文件不是必须的，`gws` 也不会自动生成它。没有配置文件时，Project 名称来自当前目录，默认分支来自 Git。
+元数据存放在 Git common 目录下，因此同一仓库的所有 worktree 共享一份状态；克隆仓库不会带走任何 `gws` 数据。可选配置文件为 `.git/gws/config.json`：
 
-全局状态默认保存在 `~/.git-workspace`，可通过 `GIT_WORKSPACE_HOME` 覆盖。持久化的 Project 和 Workspace 记录包含状态格式版本；没有版本的旧记录按版本 1 读取，来自未来版本且当前程序不支持的记录会被拒绝，不会被覆盖。
+```json
+{ "version": 1, "default_branch": "main" }
+```
+
+`default_branch` 用于 HEAD 处于 detached 且未指定 `--base` 时的兜底基线。`gws` 不会自动生成该文件。
+
+持久化记录包含状态格式版本；没有版本的旧记录按版本 1 读取，来自未来版本且当前程序不支持的记录会被拒绝，不会被覆盖。
 
 ## 贡献与安全
 
