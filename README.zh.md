@@ -162,6 +162,56 @@ gws finish issue-328 --json
 
 `internal/` 下的包不是公共 Go API。受支持的集成入口是带版本的 `gws --json` 子进程协议。
 
+## 与 AI Agent 集成
+
+`gws` 就是为编程 Agent 设计的：开一个可丢弃的 worktree 让它干活，再通过一道
+"不合格不放行"的闸门合并回来。
+
+### 安装 skill
+
+仓库自带一份 Agent Skill，教会任意客户端（opencode、Claude Code、Codex 等）
+完整工作流和错误码路由。复制到你的 skills 目录即可：
+
+```bash
+git clone https://github.com/sanm00/gitworkspace /tmp/gitworkspace
+mkdir -p ~/.agents/skills
+cp -R /tmp/gitworkspace/skills/git-workspace ~/.agents/skills/git-workspace
+```
+
+opencode 读取 `~/.agents/skills/`，其他客户端用各自目录（例如
+`~/.claude/skills/`）。skill 会在"隔离做这件事"、"开个空间"、"只读排查这个
+PR"、"别动我当前分支"等请求下触发。
+
+### 或者直接把这段丢给 Agent
+
+不想装 skill 的话，把下面这段提示词发给 Agent 一次，它会装好工具并记住流程：
+
+```text
+用 `go install github.com/sanm00/gitworkspace/cmd/gws@latest` 安装 Git Workspace，
+并用 `gws --version` 验证。之后当我要求你隔离完成某个任务时，执行
+`gws new <name> --no-enter --json`，所有编辑都在返回的 `data.worktree_path` 内进行，
+用 `gws diff`/`gws log` 检查，交付时在 worktree 内执行
+`git -C <path> add -A && gws commit -m "..."`，再执行 `gws apply --json`，
+并按 `error.code` 分流而不是盲目重试。不要运行 `gws use`（交互式），也不要手动
+切换我主检出的分支。只读审查或复现请用
+`gws new <name> --base <ref> --type review --no-enter --json`。
+```
+
+直接 clone 本仓库也行：放进 checkout 的 Agent 会自动读取
+[`AGENTS.md`](AGENTS.md) 和 [`skills/git-workspace/SKILL.md`](skills/git-workspace/SKILL.md)。
+
+### Agent 能得到什么
+
+- `gws new --no-enter --json` 直接返回 worktree 路径、id 和基线 commit，无需解析
+  porcelain 输出。
+- 错误是结构化的：`merge_conflict`、`target_dirty`、`apply_target_not_checked_out`、
+  `workspace_dirty` 等，每个都带稳定的 `code` 和 `details`。
+- 只读的 `review`/`test` 空间在物理上无法被 apply，让自动化代码审查天然安全。
+- 跨进程锁让多个 Agent 各持一个空间，互不踩踏共享状态。
+
+不需要 MCP server——Agent 通过 shell 工具调用 gws 即可。基于同一套 `--json` 协议
+的薄 MCP shim 是未来的可选项，不是前置条件。
+
 ## 配置与状态
 
 `gws` 持久化的一切都在仓库内部：

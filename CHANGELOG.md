@@ -14,6 +14,8 @@ are expected between minor versions.
 - Initial Git worktree lifecycle commands and versioned JSON machine interface.
 - Cross-platform CI, security scanning, and tagged release automation.
 - Versioned Workspace records with base branch and base commit tracking.
+- Bundled Agent Skill (`skills/git-workspace/SKILL.md`) and `AGENTS.md` so coding
+  agents can install and drive gws end to end.
 - Everyday Git wrappers that resolve the Workspace from `cwd`: `gws diff`
   (relative to base, `--uncommitted`, `--staged`, `--stat`, untracked file
   list), `gws log` (`-n N`, `--stat`), and `gws commit -m ... [-a]`.

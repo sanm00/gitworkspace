@@ -193,6 +193,65 @@ for the contract.
 Packages under `internal/` are not a public Go API. The supported integration
 interface is the versioned `gws --json` subprocess protocol.
 
+## AI agent integration
+
+`gws` is built for coding agents: create a disposable worktree, let the agent
+work there, then merge through a gate that refuses half-finished results.
+
+### Install the skill
+
+The bundled Agent Skill teaches any client (opencode, Claude Code, Codex, ...)
+the workflow and the error-code routing. Copy it into your agent's skills
+directory:
+
+```bash
+git clone https://github.com/sanm00/gitworkspace /tmp/gitworkspace
+mkdir -p ~/.agents/skills
+cp -R /tmp/gitworkspace/skills/git-workspace ~/.agents/skills/git-workspace
+```
+
+opencode reads `~/.agents/skills/`; other clients use their own location, for
+example `~/.claude/skills/`. The skill triggers on requests like "work on this
+in isolation", "open a workspace", "review this ref without touching my branch",
+or their Chinese equivalents.
+
+### Or paste this into your agent
+
+If you would rather not install a skill, give the agent this prompt once; it
+installs the tool and learns the loop:
+
+```text
+Install Git Workspace with `go install github.com/sanm00/gitworkspace/cmd/gws@latest`
+and verify with `gws --version`. From now on, when I ask you to work on a task in
+isolation, run `gws new <name> --no-enter --json`, do all edits inside the returned
+`data.worktree_path`, inspect with `gws diff`/`gws log`, deliver with
+`git -C <path> add -A && gws commit -m "..."` followed by `gws apply --json` from
+inside the worktree, and route on `error.code` instead of retrying blindly. Never
+run `gws use` (interactive) and never switch branches in my main checkout by hand.
+For read-only review or repro, use `gws new <name> --base <ref> --type review
+--no-enter --json`.
+```
+
+Cloning this repository at all also works: an agent dropped into the checkout
+reads [`AGENTS.md`](AGENTS.md) and
+[`skills/git-workspace/SKILL.md`](skills/git-workspace/SKILL.md) automatically.
+
+### What the agent gets
+
+- `gws new --no-enter --json` returns the worktree path, id, and base commit, so
+  the agent never has to parse porcelain output.
+- Errors are structured: `merge_conflict`, `target_dirty`,
+  `apply_target_not_checked_out`, `workspace_dirty`, and so on, each with a
+  stable `code` and `details`.
+- Read-only `review`/`test` workspaces physically cannot be applied, which makes
+  automated code review safe.
+- Inter-process locking means several agents can each hold their own workspace
+  without stomping on shared state.
+
+No MCP server is required — agents use gws through their shell tool. A thin MCP
+shim over the same `--json` protocol is a possible future addition, not a
+prerequisite.
+
 ## Configuration and state
 
 Everything `gws` persists lives inside the repository:
