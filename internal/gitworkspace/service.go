@@ -483,6 +483,14 @@ func (a *App) applyWorkspaceUnlocked(ctx context.Context, workspace Workspace, i
 	if mainRepo.CurrentBranch != target {
 		return fail("apply_target_not_checked_out", fmt.Sprintf("The main checkout %s is on branch %q, not the target %q. Run: git -C %s checkout %s, or apply into another branch with --into %s.", mainTree, mainRepo.CurrentBranch, target, mainTree, target, mainRepo.CurrentBranch))
 	}
+	pending, err := a.Git.CountCommits(ctx, repoPath, target+".."+result.SourceBranch)
+	if err != nil {
+		return result, err
+	}
+	if pending == 0 {
+		result.TargetBranch = target
+		return result, nil
+	}
 	targetDirty, err := a.Git.IsDirtyTracked(ctx, mainTree)
 	if err != nil {
 		return result, err

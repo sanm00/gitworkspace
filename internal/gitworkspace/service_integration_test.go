@@ -500,6 +500,29 @@ func TestApplyBlockedOnDirtyWorkspaceAndDirtyTarget(t *testing.T) {
 	}
 }
 
+func TestApplySkipsDirtyTargetWhenNothingToMerge(t *testing.T) {
+	ctx := context.Background()
+	repo := testRepository(t)
+	app := newTestApp(t, repo)
+	workspace, err := app.CreateWorkspace(ctx, CreateRequest{CWD: repo, Type: WorkspaceDev, Name: "clean", Base: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("modified\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath})
+	if err != nil {
+		t.Fatalf("apply with no commits ahead should skip the dirty target check: %v", err)
+	}
+	if result.TargetBranch != "main" {
+		t.Fatalf("target branch=%q want main", result.TargetBranch)
+	}
+	if got := strings.TrimSpace(gitCommand(t, repo, "rev-parse", "HEAD")); got != workspace.Source.BaseCommit {
+		t.Fatalf("main HEAD moved to %q, base commit %q", got, workspace.Source.BaseCommit)
+	}
+}
+
 func TestApplyConflictPreservesWorkspace(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepository(t)
