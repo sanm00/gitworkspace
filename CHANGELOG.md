@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file. The project
 uses semantic versioning and keeps incompatible behavior under v0 releases
 explicit in release notes.
 
+## v0.1.2 - 2026-11-02
+
+Patch release on top of v0.1.1; no breaking changes to the CLI, JSON protocol,
+or persisted state. Existing Workspaces keep working because metadata stores
+absolute paths.
+
+### Fixed
+
+- `gws apply`/`gws finish` no longer report `target_dirty` when the main
+  checkout only has untracked files. Tracked changes still block, and Git still
+  refuses the merge if it would overwrite an untracked file.
+
 ## v0.1.1 - 2026-10-30
 
 Patch release on top of v0.1.0; no breaking changes to the CLI, JSON protocol,

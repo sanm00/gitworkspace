@@ -149,7 +149,7 @@ gws finish [WORKSPACE] [--into BRANCH]
 - 无目标：基线是纯 SHA 且未给 `--into`；
 - 源分支与目标分支相同；
 - 主检出处于 detached HEAD，或不在目标分支上（绝不自动切换）；
-- 主检出存在未提交修改；
+- 主检出存在已跟踪的未提交修改（未跟踪文件不阻塞；若合并会覆盖某个未跟踪文件，Git 仍会拒绝合并）；
 - 合并冲突——冲突保留在主检出中供常规 Git 解决或 `git merge --abort`，Workspace 不被清理。
 
 阻塞错误包含 `workspace_id`、`source_branch` 结构化详情，以及指明具体 Git 命令或 `--into` 备选的可操作消息。

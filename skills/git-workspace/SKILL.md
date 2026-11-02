@@ -82,7 +82,7 @@ an error envelope, do not retry blindly. Route on `error.code`:
 | `workspace_missing` | worktree was deleted | tell the user to recreate it |
 | `workspace_branch_mismatch` | worktree is on another branch | stop; report it |
 | `apply_target_not_checked_out` | main checkout is on a different branch | **ask the user**; never switch branches yourself |
-| `target_dirty` | main checkout has uncommitted changes | **ask the user** to clean it |
+| `target_dirty` | main checkout has tracked uncommitted changes (untracked files are fine) | **ask the user** to clean it |
 | `apply_sha_target` | base is a SHA | ask the user for a target branch, then `--into <branch>` |
 | `merge_conflict` | merge stopped mid-way | stop, report the conflict, let a human resolve or `git merge --abort` |
 | `workspace_not_ready` | state is `creating`/`error`/`removing` | run `gws status` and report |

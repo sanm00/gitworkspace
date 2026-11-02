@@ -485,17 +485,18 @@ func TestApplyBlockedOnDirtyWorkspaceAndDirtyTarget(t *testing.T) {
 	}
 	gitCommand(t, workspace.WorktreePath, "add", "d.txt")
 	gitCommand(t, workspace.WorktreePath, "commit", "-m", "d")
-	if err := os.WriteFile(filepath.Join(repo, "local.txt"), []byte("local\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("modified\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath}); ErrorCode(err) != "target_dirty" {
 		t.Fatalf("expected target_dirty, got %v", err)
 	}
-	if err := os.Remove(filepath.Join(repo, "local.txt")); err != nil {
+	gitCommand(t, repo, "checkout", "--", "README.md")
+	if err := os.WriteFile(filepath.Join(repo, "local.txt"), []byte("local\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := app.ApplyWorkspace(ctx, ApplyRequest{CWD: workspace.WorktreePath}); err != nil {
-		t.Fatalf("apply after cleaning target: %v", err)
+		t.Fatalf("untracked files in the target checkout should not block apply: %v", err)
 	}
 }
 

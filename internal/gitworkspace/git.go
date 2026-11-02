@@ -167,6 +167,14 @@ func (g Git) IsDirty(ctx context.Context, path string) (bool, error) {
 	return strings.TrimSpace(result.Stdout) != "", nil
 }
 
+func (g Git) IsDirtyTracked(ctx context.Context, path string) (bool, error) {
+	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", path, "status", "--porcelain", "--untracked-files=no"}})
+	if err != nil {
+		return false, WrapError("external_command_failed", "Failed to inspect Git status.", err)
+	}
+	return strings.TrimSpace(result.Stdout) != "", nil
+}
+
 func (g Git) IsWorktree(ctx context.Context, path string) bool {
 	result, err := g.Runner.Run(ctx, Command{Path: "git", Args: []string{"-C", path, "rev-parse", "--is-inside-work-tree"}})
 	return err == nil && strings.TrimSpace(result.Stdout) == "true"

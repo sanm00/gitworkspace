@@ -216,7 +216,8 @@ with a structured blocking reason (`apply_blocked` family):
 - no target: base is a pure SHA and no `--into` was given;
 - source equals target;
 - main checkout detached, or not on the target branch (never auto-switched);
-- main checkout dirty;
+- main checkout has tracked uncommitted changes (untracked files do not block;
+  Git still refuses the merge if it would overwrite one);
 - merge conflict — the conflict is left in the main checkout for normal Git
   resolution or `git merge --abort`, and the Workspace is preserved.
 
